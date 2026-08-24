@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------------
+# Secrets - never commit these
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# Telethon session files are login credentials in binary form.
+*.session
+*.session-journal
+sessions/*
+!sessions/.gitkeep
+
+# ---------------------------------------------------------------------------
+# Runtime state
+# ---------------------------------------------------------------------------
+logs/*
+!logs/.gitkeep
+
+# The bot edits these at runtime. The tracked copies live in data/defaults/,
+# so a `git pull` during deploy can never conflict with local changes.
+data/keywords.txt
+data/watcher_settings.json
+data/*.corrupt
+data/.*.tmp
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# ---------------------------------------------------------------------------
+# Editors and OS noise
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,13 @@
+# Shell scripts and Python must use LF endings, or they break on the Linux VPS
+# after being committed from Windows.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.json text eol=lf
+*.txt  text eol=lf
+*.md   text eol=lf
+Dockerfile text eol=lf
+
+# Never let git touch session files if one is ever added by accident.
+*.session binary

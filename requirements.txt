@@ -1,0 +1,8 @@
+# MAKIMA runtime dependencies. Pinned so a rebuild is reproducible.
+telethon==1.36.0
+python-dotenv==1.0.1
+
+# Optional: a C implementation of Telegram's crypto, roughly 2-5x faster on
+# large media. Not required; uncomment if you want it and the wheel installs
+# cleanly on your platform.
+# cryptg==0.4.0

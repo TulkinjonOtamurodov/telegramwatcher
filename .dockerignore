@@ -1,0 +1,27 @@
+.git
+.gitignore
+.gitattributes
+
+# Secrets and credentials must never end up in an image layer.
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+sessions/
+logs/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.idea/
+.vscode/
+.DS_Store
+
+README.md
+LICENSE

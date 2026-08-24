@@ -1,0 +1,38 @@
+# MAKIMA default keywords.
+#
+# One keyword or phrase per line. Blank lines and lines starting with '#'
+# are ignored. Matching is case-insensitive and boundary-aware, so "claim"
+# does NOT fire on "disclaimer". Multi-word phrases such as "fuel card"
+# are supported; when a phrase matches, the shorter keywords inside it are
+# left out of the alert preview.
+#
+# This file is the shipped default and is tracked in git. The live list the
+# bot edits is data/keywords.txt, which is created from this file on first
+# run and is git-ignored.
+
+safety
+claim
+claims
+accident
+incident
+inspection
+violation
+citation
+oos
+mvr
+psp
+insurance
+attorney
+lawsuit
+damage
+injury
+police
+dot
+permit
+fuel
+fuel card
+card
+camera
+termination
+terminate
+lease

@@ -1,0 +1,37 @@
+services:
+  makima:
+    build: .
+    image: makima-watcher:latest
+    container_name: makima-watcher
+    restart: unless-stopped
+
+    # PID 1 reaper, so SIGTERM from `docker compose stop/restart` reaches Python
+    # and the SQLite session files are closed cleanly instead of left locked.
+    init: true
+    stop_grace_period: 30s
+
+    # Secrets come from .env on the host and are never baked into the image.
+    env_file:
+      - .env
+
+    environment:
+      TZ: UTC
+
+    # Everything that must survive a rebuild lives on the host.
+    volumes:
+      - ./data:/app/data
+      - ./sessions:/app/sessions
+      - ./logs:/app/logs
+
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.health"]
+      interval: 5m
+      timeout: 30s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
