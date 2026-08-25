@@ -1,347 +1,549 @@
-# Deploying MAKIMA on a Hostinger VPS
+# Deploying MAKIMA on a Hostinger VPS — full walkthrough
 
-A complete, do-this-in-order runbook. Every command is meant to be pasted into
-an SSH session as `root`. Checkpoints tell you what you should see before moving
-on — if a checkpoint does not match, stop there and fix it rather than
-continuing.
+This is a complete, do-this-in-order guide. It assumes you have never deployed a
+Docker application to a Linux server before, and explains what each command does
+rather than just listing it.
 
-Total time: about 20 minutes, most of it waiting for Docker to install.
+**How to use this page.** Every step has three parts:
+
+1. **Run** — the command to paste.
+2. **Expect** — what a successful result looks like.
+3. **If it goes wrong** — what to do when it doesn't.
+
+If a step's output doesn't match "Expect", stop and resolve it before moving on.
+Continuing past a broken step is what turns a 20-minute deployment into a
+two-hour one.
+
+**Two values you must substitute throughout:**
+
+| Placeholder | Replace with |
+| --- | --- |
+| `YOUR_VPS_IP` | Your server's IP address, from hPanel |
+| `YOUR_GITHUB_USERNAME` | Your GitHub account name |
+
+**Time:** about 25 minutes, most of it waiting on downloads.
 
 ---
 
 ## Contents
 
-- [0. What you need before you start](#0-what-you-need-before-you-start)
-- [1. Find your VPS details in hPanel](#1-find-your-vps-details-in-hpanel)
-- [2. Connect over SSH from Windows](#2-connect-over-ssh-from-windows)
-- [3. Take a snapshot first](#3-take-a-snapshot-first)
-- [4. Prepare the server](#4-prepare-the-server)
-- [5. Install Docker](#5-install-docker)
-- [6. Firewall](#6-firewall)
-- [7. Put the code on the VPS](#7-put-the-code-on-the-vps)
-- [8. Create the .env file](#8-create-the-env-file)
-- [9. Authenticate your Telegram account](#9-authenticate-your-telegram-account)
-- [10. Start the bot chat](#10-start-the-bot-chat)
-- [11. Launch MAKIMA](#11-launch-makima)
-- [12. Lock down ADMIN_USER_IDS](#12-lock-down-admin_user_ids)
-- [13. Confirm it survives a reboot](#13-confirm-it-survives-a-reboot)
-- [14. Day-to-day operations](#14-day-to-day-operations)
-- [15. Backups](#15-backups)
-- [16. Migrating from the old watcher](#16-migrating-from-the-old-watcher)
-- [17. Hostinger-specific gotchas](#17-hostinger-specific-gotchas)
+**Setup**
+- [Step 0 — Prerequisites checklist](#step-0--prerequisites-checklist)
+- [Step 1 — Get your VPS details from hPanel](#step-1--get-your-vps-details-from-hpanel)
+- [Step 2 — Take a snapshot](#step-2--take-a-snapshot)
+- [Step 3 — Connect over SSH](#step-3--connect-over-ssh)
+- [Step 4 — Prepare the server](#step-4--prepare-the-server)
+- [Step 5 — Install Docker](#step-5--install-docker)
+
+**Deploy**
+- [Step 6 — Push the code to GitHub](#step-6--push-the-code-to-github)
+- [Step 7 — Clone the repo on the VPS](#step-7--clone-the-repo-on-the-vps)
+- [Step 8 — Create the .env file](#step-8--create-the-env-file)
+- [Step 9 — Build and smoke-test](#step-9--build-and-smoke-test)
+- [Step 10 — Authenticate your Telegram account](#step-10--authenticate-your-telegram-account)
+- [Step 11 — Press Start in the bot chat](#step-11--press-start-in-the-bot-chat)
+- [Step 12 — Launch](#step-12--launch)
+- [Step 13 — Test it for real](#step-13--test-it-for-real)
+- [Step 14 — Set ADMIN_USER_IDS](#step-14--set-admin_user_ids)
+- [Step 15 — Verify it survives a reboot](#step-15--verify-it-survives-a-reboot)
+
+**Living with it**
+- [Operations cheat sheet](#operations-cheat-sheet)
+- [The update workflow](#the-update-workflow)
+- [Backups](#backups)
+- [Migrating from the old watcher](#migrating-from-the-old-watcher)
+- [Troubleshooting matrix](#troubleshooting-matrix)
+- [Hostinger-specific notes](#hostinger-specific-notes)
 
 ---
 
-## 0. What you need before you start
+# Setup
 
-| Thing | Where it comes from |
-| --- | --- |
-| hPanel login | hostinger.com account |
-| VPS IP address and root password | hPanel → VPS |
-| `api_id` + `api_hash` | <https://my.telegram.org> → API development tools |
-| Bot token | @BotFather → `/newbot` or `/mybots` |
-| Your phone, with Telegram open | You will receive a login code during step 9 |
-| A GitHub repo containing this project | See [step 7](#7-put-the-code-on-the-vps) |
+## Step 0 — Prerequisites checklist
 
-Have the phone in your hand for step 9. The login code expires quickly.
+Tick all six before you start. Missing one halfway through is annoying.
+
+| # | Thing | Where to get it | Looks like |
+| --- | --- | --- | --- |
+| 1 | hPanel login | hostinger.com | — |
+| 2 | VPS IP + root password | hPanel → VPS | `203.0.113.10` |
+| 3 | `api_id` and `api_hash` | <https://my.telegram.org> → API development tools | `35221038` / 32 hex chars |
+| 4 | Bot token | @BotFather → `/newbot`, or `/mybots` for an existing one | `123456789:AAE...` |
+| 5 | Your phone, Telegram open | — | You get a login code in Step 10 |
+| 6 | A GitHub account | github.com | — |
+
+**Have the phone within reach for Step 10.** The Telegram login code expires in
+a couple of minutes and re-requesting it too often triggers a rate limit.
 
 ---
 
-## 1. Find your VPS details in hPanel
+## Step 1 — Get your VPS details from hPanel
 
 Log into hPanel and open **VPS** → your server.
 
-- The **Overview** page shows the **IP address** and the OS template.
-- Root access lives in the SSH / root-password area of the VPS menu. If you do
-  not remember the root password, reset it there — it applies within a minute.
-- There is also a **Browser terminal** button. It works, but use a real SSH
-  client for step 9; browser terminals sometimes swallow interactive input.
+**What you need from this page:**
 
-hPanel's exact menu labels shift between redesigns. If a name below does not
-match what you see, look for the equivalent section — the concepts (IP, root
-password, snapshots, firewall) are always there.
+- **IP address** — shown on the Overview page. Write it down.
+- **Root password** — set when the VPS was created. If you don't remember it,
+  find the SSH access / root password section in the VPS menu and reset it. The
+  change applies within about a minute.
+- **OS template** — the Overview page names it. This guide assumes Ubuntu 22.04
+  or 24.04.
 
-**Which OS?** This guide assumes Ubuntu 22.04 or 24.04, which is what Hostinger
-installs by default. Check with `cat /etc/os-release` once you are connected.
+> hPanel's menu labels change between redesigns. If a name here doesn't match
+> what you see, look for the equivalent — the concepts (IP, root password,
+> snapshots, firewall, browser terminal) are always present somewhere in the VPS
+> section.
 
-If you chose Hostinger's **"Ubuntu with Docker"** application template, Docker is
-already installed — you can skim step 5, but still run its verification commands.
+**If you chose Hostinger's "Ubuntu with Docker" application template**, Docker is
+already installed. You still run Step 5's verification commands; you just skip
+the install itself.
 
 ---
 
-## 2. Connect over SSH from Windows
+## Step 2 — Take a snapshot
 
-Windows 11 ships with an SSH client. Open **PowerShell** (not the Claude Code
-terminal) and run:
+Before changing anything, create a rollback point: hPanel → VPS → **Snapshots** →
+**Create snapshot**. It takes two or three minutes.
 
-```powershell
+Hostinger keeps one manual snapshot per VPS — making a new one replaces the old.
+If anything in this guide goes badly wrong, restoring it returns the server to
+exactly this moment.
+
+This is optional but costs you nothing except a few minutes.
+
+---
+
+## Step 3 — Connect over SSH
+
+Windows 11 has an SSH client built in. Open **PowerShell** — the normal Windows
+one, not this Claude Code terminal.
+
+**Run:**
+
+```bash
 ssh root@YOUR_VPS_IP
 ```
 
-The first connection asks:
+**Expect:** on the very first connection, a fingerprint prompt:
 
 ```
-The authenticity of host '203.0.113.10' can't be established.
-ED25519 key fingerprint is SHA256:xxxxxxxx...
+The authenticity of host '203.0.113.10 (203.0.113.10)' can't be established.
+ED25519 key fingerprint is SHA256:aBcDeFg...
 Are you sure you want to continue connecting (yes/no/[fingerprint])?
 ```
 
-Type `yes` and press Enter, then enter the root password. Nothing appears while
-you type the password — that is normal.
+Type `yes` and press Enter. Then it asks for the password:
 
-**Checkpoint.** Your prompt should now look like `root@srv123456:~#`.
-
-### Optional but recommended: switch to key-based login
-
-Passwords over SSH get brute-forced constantly on public IPs. On **your Windows
-machine**:
-
-```powershell
-ssh-keygen -t ed25519 -C "makima-vps"
-Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub
+```
+root@203.0.113.10's password:
 ```
 
-Copy that public key into hPanel → VPS → **SSH Keys** → Add key. After that,
-`ssh root@YOUR_VPS_IP` logs in without a password.
+Type the root password. **Nothing appears as you type** — no dots, no asterisks.
+That's normal, not a frozen terminal. Press Enter.
 
-Once keys work, you can disable password login entirely (optional):
+You land on a prompt like:
+
+```
+root@srv123456:~#
+```
+
+Everything from here until Step 6 is typed at that prompt, on the server.
+
+**If it goes wrong:**
+
+| Symptom | Fix |
+| --- | --- |
+| `Connection refused` | The VPS is off or still provisioning. Check hPanel shows it Running |
+| `Connection timed out` | Wrong IP, or a firewall rule is blocking port 22 |
+| `Permission denied (publickey,password)` | Wrong password. Reset it in hPanel |
+| `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED` | The VPS was rebuilt. Run `ssh-keygen -R YOUR_VPS_IP` on Windows, then reconnect |
+
+### Optional: switch to key-based login
+
+Public IPs get brute-forced constantly. Key auth is both safer and more
+convenient. On **Windows**, in PowerShell:
 
 ```bash
-sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-systemctl restart ssh
+ssh-keygen -t ed25519 -C "makima-vps"
 ```
 
-Do this **only** after you have confirmed key login works in a second terminal.
-Locking yourself out means a rebuild.
+Press Enter three times to accept the defaults. Then display the public key:
+
+```bash
+type $env:USERPROFILE\.ssh\id_ed25519.pub
+```
+
+Copy the whole line and add it in hPanel → VPS → **SSH Keys**. After that,
+`ssh root@YOUR_VPS_IP` connects with no password.
+
+Only once you've confirmed key login works — in a *second* PowerShell window,
+keeping the first one open — you can disable passwords entirely:
+
+```bash
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && systemctl restart ssh
+```
+
+Keep that first session open until you've proven a fresh key login succeeds. If
+you lock yourself out, the only way back in is a hPanel rebuild, which wipes the
+disk.
 
 ---
 
-## 3. Take a snapshot first
+## Step 4 — Prepare the server
 
-Before installing anything, make a rollback point. hPanel → VPS → **Snapshots**
-→ **Create snapshot**. It takes a couple of minutes.
+### 4a. Update the system
 
-Hostinger keeps one manual snapshot; creating a new one replaces the old. If
-anything in this guide goes badly wrong, restoring that snapshot puts the server
-back exactly as it was.
-
----
-
-## 4. Prepare the server
+**Run:**
 
 ```bash
 apt update && apt upgrade -y
 ```
 
-If it asks about keeping local config files, keep the current version (the
-default). If it says a reboot is required:
+**Expect:** a few minutes of package downloads. If a purple dialog asks about
+configuration files or service restarts, accept the default (Enter / "keep the
+local version currently installed").
+
+If it finishes saying a reboot is required:
 
 ```bash
 reboot
 ```
 
-Wait ~30 seconds and reconnect with `ssh root@YOUR_VPS_IP`.
+Your SSH session drops — that's expected. Wait 30 seconds, reconnect with
+`ssh root@YOUR_VPS_IP`.
 
-Check what you are working with:
+### 4b. Check what you're working with
 
-```bash
-cat /etc/os-release | head -2
-free -h
-df -h /
-nproc
-```
-
-**Checkpoint.** You want at least ~1 GB free RAM and ~5 GB free disk. Any
-Hostinger KVM plan clears this easily. MAKIMA itself idles at roughly 80–120 MB.
-
-If `free -h` shows no swap and you are on the smallest plan, add some — the
-Docker build is the only memory-hungry moment:
+**Run:**
 
 ```bash
-fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
-echo '/swapfile none swap sw 0 0' >> /etc/fstab
+cat /etc/os-release | head -2 && echo "---" && free -h && echo "---" && df -h / && echo "---" && nproc
 ```
+
+**Expect** something like:
+
+```
+PRETTY_NAME="Ubuntu 22.04.4 LTS"
+NAME="Ubuntu"
+---
+               total        used        free      shared  buff/cache   available
+Mem:           3.8Gi       248Mi       3.3Gi       1.0Mi       291Mi       3.3Gi
+Swap:             0B          0B          0B
+---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda1        49G  2.1G   45G   5% /
+---
+1
+```
+
+**What you need:** roughly 1 GB of free RAM and 5 GB of free disk. Any Hostinger
+KVM plan clears this comfortably. MAKIMA idles at about 80–120 MB of RAM.
+
+### 4c. Add swap if you have none and little RAM
+
+Only needed if `free -h` showed `Swap: 0B` **and** under 2 GB total memory. The
+Docker build is the only memory-hungry moment in this whole process.
+
+```bash
+fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab
+```
+
+Verify with `free -h` — you should now see 2.0Gi of swap.
 
 ---
 
-## 5. Install Docker
+## Step 5 — Install Docker
 
-**Do not** use `apt install docker-compose-plugin` — that package does not exist
-in Ubuntu 22.04's repositories. Use Docker's own installer, which works on both
-22.04 and 24.04 and includes the `docker compose` plugin:
+**Important:** do **not** use `apt install docker-compose-plugin`. That package
+does not exist in Ubuntu 22.04's repositories and the command fails with
+`E: Unable to locate package docker-compose-plugin`.
 
-```bash
-apt install -y git curl
-curl -fsSL https://get.docker.com | sh
-systemctl enable --now docker
-```
-
-That downloads and runs Docker's official convenience script from
-`get.docker.com`. It takes a few minutes.
-
-**Checkpoint.** Both of these must print a version:
+### 5a. Check whether Docker is already there
 
 ```bash
 docker --version
-docker compose version
 ```
 
-Expect something like `Docker version 27.x` and `Docker Compose version v2.x`.
-If `docker compose version` errors with "is not a docker command", the plugin
-did not install — re-run the script above.
+If that prints a version, you're on Hostinger's Docker template — skip to 5c.
+If it says `command not found`, continue.
 
-Confirm the daemon is healthy:
+### 5b. Install
+
+**Run:**
 
 ```bash
-docker run --rm hello-world
+apt install -y git curl && curl -fsSL https://get.docker.com | sh
 ```
 
-You should see "Hello from Docker!". If this fails, nothing later will work.
+This downloads and runs Docker's official installation script, which adds
+Docker's apt repository and installs the engine, the CLI, buildx and the
+`docker compose` plugin — all the pieces, in one step, correctly, on both 22.04
+and 24.04.
+
+**Expect:** two to four minutes of output ending with a summary block mentioning
+Docker Engine and a note about running Docker as a non-root user (which you can
+ignore — you are root).
+
+Then make sure it starts on boot:
+
+```bash
+systemctl enable --now docker
+```
+
+### 5c. Verify — do not skip this
+
+**Run:**
+
+```bash
+docker --version && docker compose version && docker run --rm hello-world
+```
+
+**Expect:**
+
+```
+Docker version 27.3.1, build ce12230
+Docker Compose version v2.29.7
+
+Hello from Docker!
+This message shows that your installation appears to be working correctly.
+...
+```
+
+All three must succeed. If `docker compose version` says
+`docker: 'compose' is not a docker command`, the plugin didn't install — re-run
+5b. If `hello-world` fails, the daemon isn't healthy and nothing later will work;
+check `systemctl status docker`.
 
 ---
 
-## 6. Firewall
+# Deploy
 
-**MAKIMA needs no inbound ports at all.** It opens outbound connections to
-Telegram and nothing listens for incoming traffic. There is no web server, no
-webhook, no exposed port in `docker-compose.yml`.
+## Step 6 — Push the code to GitHub
 
-So: you do not need to change anything for MAKIMA to work.
+This part happens on **Windows**, not the VPS. Open a second PowerShell window
+(leave the SSH one open).
 
-If you use Hostinger's firewall (hPanel → VPS → **Firewall**), be careful:
+### 6a. Create an empty repository
 
-- Keep **TCP 22 inbound** allowed, or you lose SSH access.
-- Do not add outbound blocking rules. Telegram uses TCP 443 to a wide range of
-  IPs; blocking outbound traffic breaks the watcher with confusing
-  "Telegram disconnected" loops.
+On github.com click **New repository**:
 
-Hostinger's firewall applies at the network edge, so a bad rule can lock you out
-even though the server is running. Test any new firewall rule from a second
-terminal before closing your working session.
+- Name: `telegram-watcher`
+- Visibility: **Private**
+- **Do not** tick "Add a README", "Add .gitignore", or "Choose a license" — the
+  project already has all three, and adding them creates a conflict on first
+  push.
+
+### 6b. Push
+
+**Run** (in PowerShell, on Windows):
+
+```bash
+cd "C:\cloude experiments\telegram-watcher" && git remote add origin https://github.com/YOUR_GITHUB_USERNAME/telegram-watcher.git && git push -u origin main
+```
+
+You'll be prompted to sign in to GitHub — a browser window opens, or Git asks
+for a username and personal access token.
+
+**Expect:**
+
+```
+Enumerating objects: 40, done.
+...
+To https://github.com/YOUR_GITHUB_USERNAME/telegram-watcher.git
+ * [new branch]      main -> main
+branch 'main' set up to track 'origin/main'.
+```
+
+### 6c. Checkpoint — verify no secrets leaked
+
+Open the repository on GitHub in a browser and check:
+
+- There is **no `.env` file** in the file list. (`.env.example` is fine and
+  expected — it holds no values.)
+- `sessions/` contains only `.gitkeep`.
+- `data/` contains only `defaults/`.
+
+**If you see a `.env` file, stop.** Delete the repository, fix `.gitignore`
+locally, and push again. A `.env` in a repo means your bot token and API hash are
+now in git history, and deleting the file in a later commit does not remove them.
 
 ---
 
-## 7. Put the code on the VPS
+## Step 7 — Clone the repo on the VPS
 
-### 7a. First, push the project to GitHub from Windows
+Back in the SSH window.
 
-The project on your machine is at `C:\cloude experiments\telegram-watcher` and is
-already a git repository with one commit. Create an **empty private repository**
-on GitHub (no README, no .gitignore — the repo already has both), then in
-PowerShell:
-
-```powershell
-cd "C:\cloude experiments\telegram-watcher"
-git remote add origin https://github.com/YOUR_USERNAME/telegram-watcher.git
-git push -u origin main
-```
-
-**Checkpoint.** Open the repo on GitHub. You must **not** see a `.env` file, and
-`sessions/` must contain only `.gitkeep`. If you see either, stop and fix the
-`.gitignore` before going further.
-
-### 7b. Clone it on the VPS
-
-For a **public** repo:
+### If your repository is public
 
 ```bash
-cd /opt
-git clone https://github.com/YOUR_USERNAME/telegram-watcher.git
-cd /opt/telegram-watcher
-chmod +x scripts/*.sh
+cd /opt && git clone https://github.com/YOUR_GITHUB_USERNAME/telegram-watcher.git && cd /opt/telegram-watcher
 ```
 
-For a **private** repo, give the VPS a read-only deploy key:
+### If your repository is private (recommended)
+
+A private repo needs credentials on the server. The clean way is a **deploy
+key** — an SSH key that grants read-only access to this one repository, and
+nothing else in your GitHub account.
+
+**7a. Generate the key on the VPS:**
 
 ```bash
-ssh-keygen -t ed25519 -C "makima-deploy" -f /root/.ssh/github_deploy -N ""
-cat /root/.ssh/github_deploy.pub
+ssh-keygen -t ed25519 -C "makima-deploy" -f /root/.ssh/github_deploy -N "" && cat /root/.ssh/github_deploy.pub
 ```
 
-Copy that key, then on GitHub go to your repo → **Settings** → **Deploy keys** →
-**Add deploy key**. Paste it, give it a name, and leave "Allow write access"
-**unchecked**. Then tell SSH to use it:
+**Expect** a single line starting `ssh-ed25519 AAAA...` and ending
+`makima-deploy`. Select and copy the whole line.
+
+**7b. Add it to GitHub:** your repo → **Settings** → **Deploy keys** → **Add
+deploy key**. Title it `hostinger-vps`, paste the key, and leave **"Allow write
+access" unchecked** — the server only ever needs to read.
+
+**7c. Tell SSH to use that key for GitHub:**
 
 ```bash
-cat >> /root/.ssh/config <<'EOF'
-Host github.com
-  IdentityFile /root/.ssh/github_deploy
-  IdentitiesOnly yes
-EOF
-chmod 600 /root/.ssh/config
-
-cd /opt
-git clone git@github.com:YOUR_USERNAME/telegram-watcher.git
-cd /opt/telegram-watcher
-chmod +x scripts/*.sh
+printf 'Host github.com\n  IdentityFile /root/.ssh/github_deploy\n  IdentitiesOnly yes\n' >> /root/.ssh/config && chmod 600 /root/.ssh/config
 ```
 
-The first `git clone` over SSH asks you to trust `github.com` — type `yes`.
-
-**Checkpoint.**
+**7d. Clone:**
 
 ```bash
-ls -la /opt/telegram-watcher
+cd /opt && git clone git@github.com:YOUR_GITHUB_USERNAME/telegram-watcher.git && cd /opt/telegram-watcher
 ```
 
-You should see `app/`, `data/`, `scripts/`, `docker-compose.yml`, `.env.example`,
-and empty `sessions/` and `logs/` directories.
+The first connection asks you to trust `github.com` — type `yes`.
+
+### Checkpoint (either path)
+
+```bash
+ls -la /opt/telegram-watcher && ls -la /opt/telegram-watcher/scripts
+```
+
+**Expect:** `app/`, `data/`, `docs/`, `logs/`, `scripts/`, `sessions/`,
+`Dockerfile`, `docker-compose.yml`, `.env.example`, `README.md`.
+
+The scripts should already show `-rwxr-xr-x` (executable) because the executable
+bit is stored in git. If they show `-rw-r--r--` instead, fix it:
+
+```bash
+chmod +x /opt/telegram-watcher/scripts/*.sh
+```
 
 ---
 
-## 8. Create the .env file
+## Step 8 — Create the .env file
 
-`.env` exists **only on the server**. It is git-ignored and never enters the
-Docker image.
+`.env` holds your credentials. It exists **only on this server** — it is
+git-ignored, excluded from the Docker image, and never leaves the box.
+
+You have two options. The second is better because it eliminates typos.
+
+### Option A — type it on the server
 
 ```bash
-cd /opt/telegram-watcher
-cp .env.example .env
-nano .env
+cd /opt/telegram-watcher && cp .env.example .env && nano .env
 ```
 
-Fill in these five lines:
+`nano` is a simple text editor. Arrow keys move the cursor; there is no mouse.
+Fill in the five values:
 
 ```
 TELEGRAM_API_ID=35221038
-TELEGRAM_API_HASH=your_32_character_hash
+TELEGRAM_API_HASH=your_32_character_hash_here
 TELEGRAM_PHONE=+998920103240
 TELEGRAM_BOT_TOKEN=123456789:AAE...
 ADMIN_USER_IDS=
 ```
 
-Leave `ADMIN_USER_IDS` empty for now — step 12 fills it in properly.
+Leave `ADMIN_USER_IDS` empty — Step 14 fills it in once you know your numeric ID.
 
-In nano: **Ctrl+O**, Enter to save, **Ctrl+X** to exit.
+To save and quit: **Ctrl+O**, then **Enter**, then **Ctrl+X**.
 
-Then restrict it so only root can read it:
+### Option B — copy the one you already have (recommended)
 
-```bash
-chmod 600 .env
-```
-
-**Checkpoint.** No stray quotes, no trailing spaces, no blank value:
+A working `.env` already exists on your Windows machine. Copy it up instead of
+retyping. **In PowerShell on Windows:**
 
 ```bash
-grep -c '=$' .env
+scp "C:\cloude experiments\telegram-watcher\.env" root@YOUR_VPS_IP:/opt/telegram-watcher/.env
 ```
 
-That counts empty settings. `ADMIN_USER_IDS=` plus the three commented optional
-ones are fine; if any of the four required values is empty, go back and fix it.
+This transfers over the same encrypted SSH channel you're already using. No
+retyping means no typos in a 32-character hash.
+
+### Lock it down and verify
+
+Back in the SSH session:
+
+```bash
+cd /opt/telegram-watcher && chmod 600 .env && grep -v '^#' .env | grep -v '^$'
+```
+
+**Expect** your five variables printed, each with a value except
+`ADMIN_USER_IDS=`. Check carefully for:
+
+- **No quotes** around values — `TELEGRAM_API_HASH=abc123` not `="abc123"`
+- **No trailing spaces** after a value
+- **No spaces around `=`**
+- The API hash is exactly 32 characters
+- The phone starts with `+` and country code, no spaces or dashes
+
+MAKIMA validates all of this at startup and tells you specifically what's wrong,
+but catching it now saves a round trip.
 
 ---
 
-## 9. Authenticate your Telegram account
+## Step 9 — Build and smoke-test
 
-This is the one interactive step, and the one most likely to trip you up. Read
-the whole section before running the command.
+Before doing anything interactive, confirm the image builds and the code imports
+cleanly. This is the first time this code runs anywhere, so it's worth its own
+step.
+
+**Run:**
 
 ```bash
-cd /opt/telegram-watcher
-docker compose run --rm makima python -m app.auth_user
+cd /opt/telegram-watcher && docker compose build
 ```
 
-The first run builds the image (2–4 minutes). Then:
+**Expect:** three to five minutes on the first build. Docker downloads the
+`python:3.12-slim` base image, then installs Telethon and python-dotenv. The last
+lines look like:
+
+```
+ => => naming to docker.io/library/makima-watcher:latest
+```
+
+Now verify every module imports — this catches syntax errors and typos without
+touching Telegram:
+
+```bash
+docker compose run --rm makima python -c "import app.main, app.watcher, app.bot_commands, app.alerts, app.health; print('IMPORTS OK')"
+```
+
+**Expect:** `IMPORTS OK`, and nothing else.
+
+**If it goes wrong:** a `SyntaxError` or `ImportError` traceback names the exact
+file and line. Copy the whole traceback — that's what's needed to fix it. Do not
+continue to Step 10 until this prints `IMPORTS OK`.
+
+---
+
+## Step 10 — Authenticate your Telegram account
+
+This is the one interactive step and the one people most often stumble on. Read
+this whole section before running the command, and have your phone in your hand.
+
+**What this does:** logs Telethon into your personal Telegram account once, and
+saves the result to `sessions/user_session.session`. Every later start reuses
+that file, which is why the container can restart unattended forever afterwards.
+
+**Run:**
+
+```bash
+cd /opt/telegram-watcher && docker compose run --rm makima python -m app.auth_user
+```
+
+**Expect, first:**
 
 ```
 MAKIMA - Telegram user authentication
@@ -352,21 +554,29 @@ Telegram has sent a code to your Telegram app (not SMS, usually).
 Telegram login code:
 ```
 
-**Where the code arrives.** Telegram sends it as a message inside the Telegram
-app on a device where you are already logged in — usually the chat named
-"Telegram". It is **not** normally an SMS. Check your phone, and check Telegram
-Desktop if you use it.
+### Where the code actually arrives
 
-Type the code and press Enter. If the account has two-step verification:
+**It is not an SMS.** Telegram sends the login code as a message *inside the
+Telegram app*, in the official chat named **"Telegram"**, on any device where
+you're already signed in. Check your phone first, and Telegram Desktop if you use
+it.
+
+Only if you're signed in nowhere at all does Telegram fall back to SMS, and even
+then it waits a minute or two first.
+
+Type the code (digits only) and press Enter.
+
+### If two-step verification is enabled
 
 ```
 Two-factor authentication is enabled on this account.
 2FA password (hidden):
 ```
 
-Nothing echoes while you type. Press Enter.
+Type your Telegram 2FA password. **Nothing echoes** — no dots, no asterisks.
+Press Enter.
 
-**Success looks like:**
+### Success
 
 ```
 Signed in as Your Name (@yourname) (id 123456789).
@@ -377,98 +587,122 @@ Next steps:
   2. Launch the watcher:  docker compose up -d
 ```
 
-**Write down that numeric id.** You need it in step 12.
+**Write down that numeric id** — `123456789` in the example. You need it in
+Step 14.
 
-**Checkpoint.** The session file must now exist on the host:
-
-```bash
-ls -la /opt/telegram-watcher/sessions/
-```
-
-You should see `user_session.session`, a few dozen KB. Lock it down:
+### Checkpoint
 
 ```bash
-chmod 700 /opt/telegram-watcher/sessions
-chmod 600 /opt/telegram-watcher/sessions/*.session
+ls -la /opt/telegram-watcher/sessions/ && chmod 700 /opt/telegram-watcher/sessions && chmod 600 /opt/telegram-watcher/sessions/*.session
 ```
 
-### If step 9 goes wrong
+**Expect** `user_session.session`, somewhere around 20–60 KB. The `chmod`
+commands make it readable only by root — it is login credentials in file form.
 
-| Symptom | Cause and fix |
-| --- | --- |
-| `Telegram does not recognise that phone number` | Wrong format. Must include `+` and country code, no spaces |
-| `That login code is not correct` | Mistyped, or you used an old code. Re-run the command |
-| `That login code expired` | You took too long. Re-run and enter it promptly |
-| `Telegram is rate-limiting logins. Wait N seconds` | You retried too often. Wait the stated time — retrying makes it longer |
-| Nothing happens when you type | Your terminal is not passing input. Use a real SSH client, not the browser terminal |
-| Code never arrives | Check every device where you are logged into Telegram. If you are logged in nowhere, Telegram falls back to SMS after a minute or two |
+### If Step 10 goes wrong
 
-**A note on logging in from a data-centre IP.** Telegram may show a "new login"
-notification on your other devices, and if your account has never been used
-outside your home country you may see extra verification. This is normal. Do not
-delete that new session from Telegram's Devices screen — it *is* MAKIMA. It
-appears there as **MAKIMA watcher**.
+| Message | Cause | Fix |
+| --- | --- | --- |
+| `Telegram does not recognise that phone number` | Wrong format | Must be `+998920103240` — plus sign, country code, no spaces or dashes |
+| `That login code is not correct` | Typo, or you used a previously-sent code | Re-run the command and use the newest code |
+| `That login code expired` | Took too long | Re-run and enter it promptly |
+| `Telegram is rate-limiting logins. Wait N seconds` | Too many attempts | Wait the full time. Retrying sooner increases the wait |
+| `TELEGRAM_API_ID / TELEGRAM_API_HASH were rejected` | Bad credentials in `.env` | Re-copy both from my.telegram.org |
+| Typing does nothing | Terminal isn't passing input | Use a real SSH client, not hPanel's browser terminal |
+| Code never arrives anywhere | Signed out everywhere | Wait two minutes for the SMS fallback |
 
-**On automation risk, honestly:** running a user account through Telethon is
-what this project does by design, and passive reading is low-risk. But Telegram
-does limit accounts that behave abnormally. MAKIMA only reads and never posts to
-groups, which keeps you well inside normal behaviour — just do not add
-auto-replying or mass-messaging on top of it.
+### A note about logging in from a data-centre IP
+
+Your other Telegram devices will show a **new login notification**, and if the
+account has never been used outside your home country you may see extra
+verification. This is expected.
+
+In Telegram → **Settings → Devices**, the new session appears as **MAKIMA
+watcher**. Do not terminate it — that *is* your watcher. Terminating it forces
+you to redo this step.
+
+**On automation risk, honestly:** running a user account through Telethon is what
+this project does by design, and passive reading is low-risk behaviour. Telegram
+does limit accounts that act abnormally, but MAKIMA only *reads* groups and never
+posts to them, which keeps you well inside normal usage. Don't bolt
+auto-replying or bulk messaging onto it later without thinking about that.
 
 ---
 
-## 10. Start the bot chat
+## Step 11 — Press Start in the bot chat
 
-Open Telegram on your phone, search for your bot's username, open it, and press
-**Start** (or send `/start`).
+Open Telegram on your phone. Search for your bot's username. Open the chat and
+press **Start** (or send `/start`).
 
-This is not optional. Telegram forbids a bot from sending the first message to a
-user who has never started it. Skip this and MAKIMA will run perfectly while
-delivering nothing, and the log will show:
+**This is not optional.** Telegram forbids a bot from sending the first message
+to a user who has never started it. Skip this and MAKIMA runs perfectly while
+delivering nothing, and the log fills with:
 
 ```
 Cannot message 123456789 (UserIsBlockedError). Open a private chat with the bot and press Start.
 ```
 
+At this point the bot won't reply to `/start` yet — it isn't running. You're just
+opening the conversation so Telegram permits messages later.
+
 ---
 
-## 11. Launch MAKIMA
+## Step 12 — Launch
+
+**Run:**
 
 ```bash
-cd /opt/telegram-watcher
-docker compose up -d
-docker compose ps
+cd /opt/telegram-watcher && docker compose up -d && docker compose ps
 ```
 
-`docker compose ps` should show the container as `Up` (and after ~30 seconds,
-`healthy`).
+**Expect:**
 
-Watch the logs:
+```
+[+] Running 1/1
+ ✔ Container makima-watcher  Started
+
+NAME              IMAGE                    STATUS                    PORTS
+makima-watcher    makima-watcher:latest    Up 5 seconds (starting)
+```
+
+`(starting)` becomes `(healthy)` after about 30 seconds — that's the health check
+completing its first run.
+
+**Now watch the logs:**
 
 ```bash
-docker compose logs -f --tail=100
+cd /opt/telegram-watcher && docker compose logs -f --tail=100
 ```
 
-**Checkpoint.** You are looking for exactly this block:
+**Expect this sequence** (timestamps and names will differ):
 
 ```
-MAKIMA watcher starting (v1.0.0)
-Settings loaded from /app/data/watcher_settings.json
-Loaded 26 keywords from /app/data/keywords.txt
-User account authenticated
-Bot authenticated
-Alert dispatcher started
-Message watcher registered on the user client
-==========================================================
-MAKIMA TELEGRAM WATCHER ONLINE (v1.0.0)
-User: Your Name (@yourname)
-Bot: @makima_alerts_bot
-Keywords loaded: 26
-Modes: mentions=on, replies=on, keywords=on, ai=off
-==========================================================
+2026-08-25 12:00:01 | INFO | makima.main     | MAKIMA watcher starting (v1.0.0)
+2026-08-25 12:00:01 | INFO | makima.settings | Settings file /app/data/watcher_settings.json not found; creating it from defaults
+2026-08-25 12:00:01 | INFO | makima.settings | Settings loaded from /app/data/watcher_settings.json
+2026-08-25 12:00:01 | INFO | makima.keywords | Keyword file /app/data/keywords.txt not found; creating it from defaults
+2026-08-25 12:00:01 | INFO | makima.keywords | Loaded 26 keywords from /app/data/keywords.txt
+2026-08-25 12:00:03 | INFO | makima.clients  | User account authenticated
+2026-08-25 12:00:04 | INFO | makima.clients  | Bot authenticated
+2026-08-25 12:00:04 | INFO | makima.main     | ADMIN_USER_IDS is empty; defaulting to the watching account (id 123456789)
+2026-08-25 12:00:04 | INFO | makima.alerts   | Alert recipients: [123456789]
+2026-08-25 12:00:04 | INFO | makima.alerts   | Alert dispatcher started
+2026-08-25 12:00:04 | INFO | makima.watcher  | Message watcher registered on the user client
+2026-08-25 12:00:04 | INFO | makima.commands | Bot command handler registered (13 commands)
+2026-08-25 12:00:04 | INFO | makima.main     | ==========================================================
+2026-08-25 12:00:04 | INFO | makima.main     | MAKIMA TELEGRAM WATCHER ONLINE (v1.0.0)
+2026-08-25 12:00:04 | INFO | makima.main     | User: Your Name (@yourname)
+2026-08-25 12:00:04 | INFO | makima.main     | Bot: @makima_alerts_bot
+2026-08-25 12:00:04 | INFO | makima.main     | Keywords loaded: 26
+2026-08-25 12:00:04 | INFO | makima.main     | Modes: mentions=on, replies=on, keywords=on, ai=off
+2026-08-25 12:00:04 | INFO | makima.main     | ==========================================================
 ```
 
-And in Telegram, your bot messages you:
+The two "not found; creating it from defaults" lines appear only on the first
+run. That's the live `keywords.txt` and `watcher_settings.json` being seeded from
+`data/defaults/`.
+
+**And in Telegram**, your bot messages you:
 
 ```
 🟥 MAKIMA watcher is running.
@@ -476,257 +710,438 @@ And in Telegram, your bot messages you:
 Use /help in private chat.
 ```
 
-Press **Ctrl+C** to stop following the logs — that does not stop MAKIMA.
+Press **Ctrl+C** to stop following the logs. That stops the log view, not MAKIMA.
 
-**Now test it end to end.** Ask someone in one of your monitored groups to
-mention you, or post a message containing a keyword such as `inspection` in a
-group you are in. An alert should arrive within a second or two.
+### If Step 12 goes wrong
 
-If nothing arrives, send `/status` to the bot and work through the
-"Alerts are not arriving" checklist in the main [README](../README.md#alerts-are-not-arriving).
+**The container keeps restarting.** Check the last error before each restart:
+
+```bash
+cd /opt/telegram-watcher && docker compose logs --tail=50
+```
+
+The most common cause by far: you ran `docker compose up -d` *before* Step 10.
+The container starts, finds no authorised session, exits, and `restart:
+unless-stopped` starts it again in a loop. The log says exactly that:
+
+```
+Startup failed: The user session is not authorised. Run this once, interactively: ...
+```
+
+Fix it by stopping, authenticating, then starting:
+
+```bash
+cd /opt/telegram-watcher && docker compose down && docker compose run --rm makima python -m app.auth_user && docker compose up -d
+```
+
+**No startup message in Telegram** but the log shows ONLINE — you skipped
+Step 11. Press Start in the bot chat, then `docker compose restart`.
 
 ---
 
-## 12. Lock down ADMIN_USER_IDS
+## Step 13 — Test it for real
 
-Right now `ADMIN_USER_IDS` is empty, which means MAKIMA defaults to the account
-it signed in as. That works, but setting it explicitly is safer and lets you add
-a second admin.
+Verify the whole chain, not just that the process is up.
 
-Use the numeric id from step 9. If you did not write it down, send any command to
-the bot from a different account, or just read it from the logs — every
-unauthorised attempt logs the sender's id.
+**Test 1 — the bot responds.** Send `/status` to your bot in Telegram.
 
-```bash
-cd /opt/telegram-watcher
-nano .env
+**Expect:**
+
+```
+⚙️ MAKIMA STATUS
+
+Mentions: ON
+Replies: ON
+Keywords: ON
+Keywords loaded: 26
+Max preview chars: 500
+AI classification: OFF
+
+Uptime: 0h 3m 12s
+Messages inspected: 47
+Alerts raised: 0
+Alerts delivered: 1 (failed 0, queued 0)
+Account: Your Name (@yourname)
+Bot: @makima_alerts_bot
 ```
 
-Set:
+"Messages inspected" climbing confirms the watcher is genuinely seeing group
+traffic.
+
+**Test 2 — a keyword alert.** In one of your monitored groups, have someone post
+a message containing a keyword — `inspection` or `permit` works. Your own
+messages never trigger alerts, so it must come from someone else.
+
+**Expect**, within a second or two:
+
+```
+🟥 𝐌𝐀𝐊𝐈𝐌𝐀 𝐀𝐋𝐄𝐑𝐓
+━━━━━━━━━━━━━━━━━━
+🕒 2026-08-25 12:04:33 UTC
+🧠 Reason: 🔍 Keyword: inspection
+👥 Group: Dispatch Team
+🔗 Group Link: https://t.me/c/1234567890
+👤 From: Alex Driver (@alexdriver)
+🧷 Keyword hits: inspection
+📝 Message:
+Truck 155 got pulled in for a level 2 inspection.
+──────────────────
+👉 Message: https://t.me/c/1234567890/48213
+```
+
+Tap the message link — it should jump straight to that message in the group.
+
+**Test 3 — a mention.** Have someone `@yourusername` you in a group. You should
+get an alert with `🧠 Reason: 🟥 Mention`.
+
+**If no alert arrives**, work down this list in order:
+
+1. `/status` — is the bot replying at all? If not, you're not authorised or the
+   bot client isn't running.
+2. Did the message come from someone *else*? Your own messages are ignored by
+   design.
+3. Are the modes `ON` in `/status`?
+4. `docker compose logs --tail=50` — every delivery failure is logged with a
+   reason.
+5. Was the keyword actually in the message as a whole word? `inspection` matches
+   `inspection` but not `inspections` (which isn't in the default list).
+
+---
+
+## Step 14 — Set ADMIN_USER_IDS
+
+Right now `ADMIN_USER_IDS` is empty, so MAKIMA defaults to the account it signed
+in as. That works fine. Setting it explicitly is clearer, and it's how you add a
+second person.
+
+Use the numeric ID from Step 10. Lost it? Two ways to find it: send any command
+to the bot from a *different* Telegram account (the rejection reply includes that
+account's ID), or grep the log:
+
+```bash
+grep "defaulting to the watching account" /opt/telegram-watcher/logs/makima.log
+```
+
+**Edit:**
+
+```bash
+cd /opt/telegram-watcher && nano .env
+```
+
+Set the line to your ID:
 
 ```
 ADMIN_USER_IDS=123456789
 ```
 
-Multiple admins are comma-separated: `ADMIN_USER_IDS=123456789,987654321`.
-Every listed id receives alerts **and** can run commands, so only add people you
-trust with the keyword list.
+Multiple admins are comma-separated: `ADMIN_USER_IDS=123456789,987654321`. Every
+listed ID **receives alerts and can run commands**, including editing your
+keyword list — only add people you trust with that.
 
-Apply it — an env change needs a container recreate, not just a restart:
+Save with Ctrl+O, Enter, Ctrl+X.
+
+**Apply it.** An environment change needs the container recreated, not just
+restarted:
 
 ```bash
-docker compose up -d
+cd /opt/telegram-watcher && docker compose up -d
 ```
 
-**Checkpoint.** Send `/status` to the bot. It should reply with the full status
-block.
+**Checkpoint:** send `/status` again — you should get the full status block. The
+log should now read `Alert recipients: [123456789]` with no "defaulting to"
+line above it.
 
 ---
 
-## 13. Confirm it survives a reboot
+## Step 15 — Verify it survives a reboot
 
-`restart: unless-stopped` in `docker-compose.yml` plus an enabled Docker service
-means MAKIMA comes back on its own. Verify it rather than assuming:
+`restart: unless-stopped` plus an enabled Docker service means MAKIMA comes back
+by itself. Prove it rather than assuming it.
 
 ```bash
 systemctl is-enabled docker
+```
+
+**Expect:** `enabled`. If it says `disabled`, run `systemctl enable docker`.
+
+Then:
+
+```bash
 reboot
 ```
 
-Wait a minute, reconnect, and check:
+Wait about a minute, reconnect, and check:
 
 ```bash
-cd /opt/telegram-watcher
-docker compose ps
-docker compose logs --tail=30
+cd /opt/telegram-watcher && docker compose ps && docker compose logs --tail=25
 ```
 
-The container should be `Up` again and you should get a fresh
-"MAKIMA watcher is running" message in Telegram. That startup message is your
-reboot notification — if you ever get one unexpectedly, the VPS restarted.
+**Expect** the container `Up` again, a fresh ONLINE banner in the log, and a new
+"MAKIMA watcher is running" message in Telegram.
+
+That startup message doubles as a reboot notification for the rest of the
+server's life — if you ever receive one unexpectedly, your VPS restarted.
 
 ---
 
-## 14. Day-to-day operations
+# Living with it
 
-All of these run from `/opt/telegram-watcher`.
+## Operations cheat sheet
+
+Everything runs from `/opt/telegram-watcher`.
 
 | Task | Command |
 | --- | --- |
 | Deploy new code from GitHub | `./scripts/deploy.sh` |
-| Follow logs | `./scripts/logs.sh` |
+| Follow live logs | `./scripts/logs.sh` |
 | Restart (no rebuild) | `./scripts/restart.sh` |
 | Stop | `./scripts/stop.sh` |
 | Start | `./scripts/start.sh` |
+| Re-authenticate Telegram | `./scripts/auth.sh` |
 | Health check | `docker compose exec makima python -m app.health` |
-| Read the log file directly | `tail -f logs/makima.log` |
+| Read the persistent log file | `tail -f logs/makima.log` |
+| Search the log for errors | `grep -i error logs/makima.log \| tail -30` |
+| Container status | `docker compose ps` |
 | Disk used by Docker | `docker system df` |
+| Clean up old images | `docker image prune -f` |
 
-### The update workflow
+A healthy health check looks like:
 
-Edit code on Windows, commit, push, then on the VPS:
+```
+[OK  ] environment variables - api id set, bot token set, 1 admin id(s)
+[OK  ] settings file - /app/data/watcher_settings.json
+[OK  ] keyword file - 26 keyword(s)
+[OK  ] sessions directory writable - /app/sessions
+[OK  ] logs directory writable - /app/logs
+[OK  ] user session - present (28672 bytes)
+
+HEALTHY
+```
+
+**Never run `docker system prune --volumes`.** It would delete data. `docker
+image prune -f` is safe — it only removes untagged images left behind by
+rebuilds.
+
+### Two different logs
+
+| Where | What | Retention |
+| --- | --- | --- |
+| `docker compose logs` | Docker's capture of stdout | 10 MB × 5 files |
+| `logs/makima.log` | MAKIMA's own log file, on the host | 2 MB × 5 files |
+
+The file survives container rebuilds; Docker's capture does not. When
+investigating something that happened yesterday, the file is usually the better
+source.
+
+---
+
+## The update workflow
+
+Edit code on Windows → commit → push → deploy on the VPS.
+
+On Windows:
 
 ```bash
-cd /opt/telegram-watcher
-./scripts/deploy.sh
+cd "C:\cloude experiments\telegram-watcher" && git add -A && git commit -m "your message" && git push
+```
+
+On the VPS:
+
+```bash
+cd /opt/telegram-watcher && ./scripts/deploy.sh
 ```
 
 That pulls, rebuilds and restarts. `.env`, `sessions/`, `data/` and `logs/` are
-never touched — they are git-ignored on disk and bind-mounted into the container,
+never touched — they're git-ignored on disk and bind-mounted into the container,
 so your login, keywords and settings survive every deploy.
 
-If `git pull --ff-only` fails with "local changes would be overwritten", you
-edited something on the server. Check `git status`, then either `git stash` or
-commit and push those changes properly. The script refuses to guess.
+**If `git pull --ff-only` fails** with "local changes would be overwritten", you
+edited something directly on the server. Check what:
+
+```bash
+cd /opt/telegram-watcher && git status
+```
+
+Then either discard those changes (`git checkout -- <file>`) or, if they matter,
+commit and push them. The script deliberately refuses to guess which you meant.
 
 ### Most changes need no deploy at all
 
-Keywords, modes, preview length and the alert template are all changed from the
-Telegram chat with `/addkeyword`, `/setmentions`, `/setmaxchars`, `/settemplate`.
-Those write to disk instantly. Only actual code changes need `deploy.sh`.
+Keywords, modes, preview length and the alert template all change from the
+Telegram chat and are written to disk instantly:
 
-### Reclaiming disk space
-
-Old images accumulate after several deploys:
-
-```bash
-docker image prune -f
+```
+/addkeyword broker
+/removekeyword camera
+/setmentions off
+/setmaxchars 800
+/settemplate <your new template>
+/reload
 ```
 
-Safe — it only removes untagged images. Never run `docker system prune
---volumes`, which would delete data.
+Only actual Python changes need `deploy.sh`.
 
 ---
 
-## 15. Backups
+## Backups
 
 Two things are irreplaceable and neither is in git:
 
-| Path | Why it matters |
+| Path | Why |
 | --- | --- |
 | `.env` | Your credentials |
-| `sessions/*.session` | Your Telegram login. Losing it means re-authenticating |
+| `sessions/*.session` | Your Telegram login — losing it means redoing Step 10 |
 
-`data/` (keywords and settings) is nice to keep but easy to recreate.
+`data/` (keywords and settings) is worth keeping but easy to recreate.
 
-Make a local backup archive:
+**Make an archive on the VPS:**
 
 ```bash
-cd /opt
-tar czf makima-backup-$(date +%F).tar.gz \
-  telegram-watcher/.env \
-  telegram-watcher/sessions \
-  telegram-watcher/data
-ls -la makima-backup-*.tar.gz
+cd /opt && tar czf makima-backup-$(date +%F).tar.gz telegram-watcher/.env telegram-watcher/sessions telegram-watcher/data && ls -la makima-backup-*.tar.gz
 ```
 
-Copy it to your Windows machine — run this **in PowerShell on Windows**, not on
-the VPS:
+**Copy it to Windows** — run this in PowerShell on Windows, not on the VPS:
 
-```powershell
+```bash
 scp root@YOUR_VPS_IP:/opt/makima-backup-*.tar.gz "C:\backups\"
 ```
 
-**That archive contains live credentials.** Store it somewhere private, not in a
-synced folder you share, and never in a git repo.
+**That archive contains live credentials.** Keep it somewhere private — not a
+shared or synced folder, and never in a git repo.
 
-Hostinger's own snapshots and weekly backups (hPanel → VPS → Snapshots /
-Backups) cover the whole disk and are worth taking before any risky change. They
-are a whole-server restore, though — not a way to recover one file.
+Hostinger's snapshots and automatic backups (hPanel → VPS) cover the whole disk
+and are worth taking before any risky change. They're a whole-server restore
+though, not a way to recover a single file.
 
 ---
 
-## 16. Migrating from the old watcher
+## Migrating from the old watcher
 
-Your old directory has its own sessions and config. **Nothing is deleted
-automatically.** Leave it in place until the new setup has run happily for a few
+Your old setup has its own directory, sessions and config. **Nothing is deleted
+automatically.** Leave it in place until the new one has run happily for a few
 days.
 
-First, stop the old watcher — two processes cannot share a Telegram session, and
-if the old one is running you will get `database is locked` or
-`AuthKeyDuplicatedError`:
+### Stop the old watcher first
+
+Two processes cannot share a Telegram session. If the old one is still running
+you'll get `database is locked` or `AuthKeyDuplicatedError`.
 
 ```bash
-# find whatever is running the old script
 ps aux | grep -i watcher
-# stop it by PID, or if it was a systemd service:
+```
+
+Kill it by PID, or if it was a systemd service:
+
+```bash
 systemctl stop old-watcher && systemctl disable old-watcher
 ```
 
-Bring the keywords across (this is the part worth keeping):
+If it was in a screen or tmux session, `screen -ls` / `tmux ls` will find it.
+
+### Bring your keywords across
+
+This is the part actually worth migrating:
 
 ```bash
 cp /opt/old-watcher/keywords.txt /opt/telegram-watcher/data/keywords.txt
 ```
 
-Then either send `/reload` to the bot, or `./scripts/restart.sh`.
+Then send `/reload` to the bot, or run `./scripts/restart.sh`.
 
-You can copy `watcher_settings.json` too — anything missing from it is filled in
-from the defaults by the deep merge, so an old partial file will not break
-anything.
+You can copy `watcher_settings.json` the same way — anything missing from an old
+file is filled in from the defaults by the deep merge, so a partial or outdated
+file won't break anything.
 
-**About the old session files.** You *can* reuse them if they were created with
-the same `api_id`/`api_hash`:
+### The old session files
+
+You *can* reuse them, if they were created with the same `api_id` and `api_hash`:
 
 ```bash
-cp /opt/old-watcher/user_session.session /opt/telegram-watcher/sessions/user_session.session
-cp /opt/old-watcher/bot_session.session  /opt/telegram-watcher/sessions/bot_session.session
-chmod 600 /opt/telegram-watcher/sessions/*.session
-docker compose up -d
+cp /opt/old-watcher/user_session.session /opt/telegram-watcher/sessions/user_session.session && cp /opt/old-watcher/bot_session.session /opt/telegram-watcher/sessions/bot_session.session && chmod 600 /opt/telegram-watcher/sessions/*.session
 ```
 
-Honestly, though: you already authenticated cleanly in step 9, so there is no
-reason to. A fresh session is the safer path.
+Honestly, though: you already authenticated cleanly in Step 10, so there's no
+reason to. If the log then shows `The user session is not authorised` or an
+auth-key error, the old sessions weren't compatible — delete them and re-run
+Step 10.
 
-Once you are confident the new setup works, retire the old one:
+### Retiring the old directory
+
+Once you're confident, and **in this order**:
+
+1. In Telegram → **Settings → Devices**, terminate the old watcher's session.
+   Do this *before* deleting the files, or that login stays valid and you'll have
+   no easy way to identify it later.
+2. Then remove the directory:
 
 ```bash
-# in Telegram: Settings -> Devices -> terminate the old watcher's session
 rm -rf /opt/old-watcher
 ```
 
-Terminate the old session in Telegram **before** deleting the files — otherwise
-that login stays valid and you have no easy way to identify it later.
+---
+
+## Troubleshooting matrix
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `database is locked` | Two processes on one session | `docker compose down`, `pkill -f app.main`, then `docker compose up -d` |
+| `AuthKeyDuplicatedError` | Same session used from two IPs | Stop every copy, delete `sessions/user_session.session`, redo Step 10 |
+| `The user session is not authorised` | No session file, or it was terminated | Redo Step 10 |
+| `TELEGRAM_BOT_TOKEN was rejected` | Wrong or revoked token | New token from @BotFather → `/mybots` → API Token |
+| `Telegram rejected TELEGRAM_API_ID / TELEGRAM_API_HASH` | Typo in `.env` | Re-copy from my.telegram.org; hash is exactly 32 hex chars |
+| `UserIsBlockedError` | Never pressed Start | Open the bot chat, press Start, `docker compose restart` |
+| `Recipient N is unreachable` | Wrong ID in `ADMIN_USER_IDS` | Fix `.env`, then `docker compose up -d` |
+| Container restart loop | Read the last error before each restart | `docker compose logs --tail=50` |
+| `FloodWaitError` in logs | Telegram rate limit | Handled automatically. Constant occurrence means a restart loop — check `docker compose ps` |
+| `Telegram disconnected` repeatedly | Network or outbound firewall | Check the VPS network; ensure outbound 443 isn't blocked |
+| Alerts stopped, no errors | Check `/status` first | If uptime is small, it's restarting; if modes are OFF, turn them on |
+| A keyword never matches | Word-boundary matching | `claim` matches `claim` but not `disclaimer` or `claims`. Add variants with `/addkeyword` |
+| `Permission denied` on session files | Ownership mismatch | `chown -R root:root /opt/telegram-watcher && chmod 600 sessions/*.session` |
+| `command not found: docker compose` | Compose plugin missing | Re-run Step 5b |
 
 ---
 
-## 17. Hostinger-specific gotchas
+## Hostinger-specific notes
 
-**The browser terminal and interactive input.** hPanel's built-in terminal is
-fine for `ls` and `docker compose logs`, but it can drop or mangle keystrokes
-during `app.auth_user`. Use a real SSH client for step 9.
+**The browser terminal.** hPanel's built-in terminal is fine for `ls` and reading
+logs, but it can drop or mangle keystrokes during interactive input. Use a real
+SSH client for Step 10 specifically.
 
-**Root by default.** Hostinger gives you root, and this guide runs everything as
-root. That means files in `sessions/` and `logs/` are root-owned, which is
-consistent because the container also runs as root. If you later create a
-non-root user, `chown -R` the whole project directory or you will hit permission
-errors.
+**Firewall — nothing to open.** MAKIMA opens outbound connections to Telegram
+and nothing listens for inbound traffic. There's no web server, no webhook, no
+exposed port in `docker-compose.yml`. You do not need to change any firewall
+setting for it to work.
 
-**Reinstalling the OS wipes everything.** hPanel's "Operating System" → rebuild
-is a full disk wipe, including `.env` and your sessions. Take the backup from
-[step 15](#15-backups) first.
+If you *do* enable Hostinger's firewall (hPanel → VPS → Firewall):
 
-**Automatic Ubuntu updates can reboot the box.** That is fine — MAKIMA restarts
-itself and messages you. If you would rather control the timing:
+- Keep **inbound TCP 22** allowed or you lose SSH access.
+- Don't add outbound blocking rules. Telegram uses TCP 443 across a wide IP
+  range; blocking outbound breaks the watcher with confusing "Telegram
+  disconnected" loops.
+- Hostinger's firewall applies at the network edge, so a bad rule locks you out
+  even though the server itself is fine. Test new rules from a second terminal
+  before closing your working session.
+
+**Running as root.** Hostinger gives you root and this guide uses it throughout.
+Files in `sessions/` and `logs/` end up root-owned, which is consistent because
+the container also runs as root. If you later create a non-root user, `chown -R`
+the whole project directory or you'll hit permission errors.
+
+**Rebuilding the OS wipes everything**, including `.env` and your sessions.
+hPanel's "Operating System" → rebuild is a full disk wipe. Take the backup from
+the [Backups](#backups) section first.
+
+**Automatic Ubuntu updates can reboot the box.** That's fine — MAKIMA restarts
+itself and messages you. To control the timing instead:
 
 ```bash
 dpkg-reconfigure -plow unattended-upgrades
 ```
 
 **Monitoring.** hPanel → VPS → Monitoring shows CPU, RAM and network. MAKIMA is
-tiny; if you see sustained CPU load, check `docker compose logs` for a restart
-loop rather than assuming the VPS is undersized.
+tiny. Sustained CPU load means a restart loop, not an undersized VPS — check
+`docker compose logs`.
 
-**IP changes.** If you ever move the VPS or change its IP, Telegram may treat
-the next connection as a new location. The session keeps working; you may just
-get a notification on your other devices.
-
-**Container logs vs the log file.** `docker compose logs` reads Docker's own
-capture (capped at 10 MB × 5 by `docker-compose.yml`). `logs/makima.log` is
-MAKIMA's own rotating file (2 MB × 5) and persists on the host across container
-rebuilds. When something went wrong yesterday, the file is usually the better
-place to look:
-
-```bash
-grep -i error /opt/telegram-watcher/logs/makima.log | tail -30
-```
+**If the VPS IP ever changes** (migration, plan change), Telegram may treat the
+next connection as a new location. The session keeps working; you'll just get a
+notification on your other devices.
