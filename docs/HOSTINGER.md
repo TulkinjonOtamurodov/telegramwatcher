@@ -1098,6 +1098,8 @@ rm -rf /opt/old-watcher
 | A keyword never matches | Word-boundary matching | `claim` matches `claim` but not `disclaimer` or `claims`. Add variants with `/addkeyword` |
 | `Permission denied` on session files | Ownership mismatch | `chown -R root:root /opt/telegram-watcher && chmod 600 sessions/*.session` |
 | `command not found: docker compose` | Compose plugin missing | Re-run Step 5b |
+| OPEN MESSAGE opens the group but not the message | Forum topic link | Fixed by the topic segment; check `url_type` in the log |
+| OPEN MESSAGE does nothing for one admin | That admin is not a member of the group | `t.me/c/` links only resolve for members |
 
 ---
 

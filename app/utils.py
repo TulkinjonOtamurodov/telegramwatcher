@@ -227,7 +227,9 @@ def build_group_link(chat: Any, fallback: str = "-") -> str:
 
 #: ``kind`` values returned by :func:`build_message_url` on success.
 LINK_PUBLIC = "public"
+LINK_PUBLIC_TOPIC = "public_topic"
 LINK_PRIVATE_SUPERGROUP = "private_supergroup"
+LINK_PRIVATE_TOPIC = "private_supergroup_topic"
 
 #: ...and the reasons it can fail.
 NO_MESSAGE_ID = "no_message_id"
@@ -235,8 +237,32 @@ NO_CHAT_METADATA = "no_chat_metadata"
 BASIC_GROUP = "basic_group"
 
 
+def forum_topic_id(message: Any) -> int | None:
+    """The topic a message sits in, for supergroups with Topics enabled.
+
+    Telegram marks such messages with ``reply_to.forum_topic``. A message posted
+    straight into a topic carries the topic root in ``reply_to_msg_id``; a reply
+    *within* a topic carries it in ``reply_to_top_id`` and uses
+    ``reply_to_msg_id`` for the message actually being replied to.
+    """
+    reply_to = getattr(message, "reply_to", None)
+    if reply_to is None or not getattr(reply_to, "forum_topic", False):
+        return None
+    topic = getattr(reply_to, "reply_to_top_id", None) or getattr(
+        reply_to, "reply_to_msg_id", None
+    )
+    try:
+        return int(topic) if topic else None
+    except (TypeError, ValueError):
+        return None
+
+
 def build_message_url(
-    chat: Any, message_id: int | None, *, chat_id: int | None = None
+    chat: Any,
+    message_id: int | None,
+    *,
+    chat_id: int | None = None,
+    topic_id: int | None = None,
 ) -> tuple[str | None, str]:
     """The single source of truth for message deep links.
 
@@ -245,6 +271,8 @@ def build_message_url(
 
     * Public groups and channels -> ``t.me/<username>/<id>``
     * Private supergroups and channels -> ``t.me/c/<internal id>/<id>``
+    * Inside a forum topic both gain a topic segment before the message id --
+      without it Telegram opens the group but does not land on the message.
     * Legacy basic groups have no deep-link form at all.
 
     ``chat_id`` is a fallback for when the chat entity could not be resolved:
@@ -255,30 +283,43 @@ def build_message_url(
     if not message_id:
         return None, NO_MESSAGE_ID
 
+    # The topic root itself needs no topic segment -- it *is* the topic.
+    suffix = f"{message_id}"
+    in_topic = bool(topic_id) and topic_id != message_id
+    if in_topic:
+        suffix = f"{topic_id}/{message_id}"
+
     username = chat_username(chat)
     if username:
-        return f"https://t.me/{username}/{message_id}", LINK_PUBLIC
+        kind = LINK_PUBLIC_TOPIC if in_topic else LINK_PUBLIC
+        return f"https://t.me/{username}/{suffix}", kind
 
+    internal = 0
     if chat is not None and is_channel(chat):
         internal = normalize_channel_id(getattr(chat, "id", 0))
-        if internal:
-            return f"https://t.me/c/{internal}/{message_id}", LINK_PRIVATE_SUPERGROUP
-
     # No usable entity: a raw -100... peer id still identifies a supergroup or
     # channel, which is exactly what the t.me/c/ form needs.
-    if chat_id is not None and str(chat_id).startswith("-100"):
+    if not internal and chat_id is not None and str(chat_id).startswith("-100"):
         internal = normalize_channel_id(chat_id)
-        if internal:
-            return f"https://t.me/c/{internal}/{message_id}", LINK_PRIVATE_SUPERGROUP
+
+    if internal:
+        kind = LINK_PRIVATE_TOPIC if in_topic else LINK_PRIVATE_SUPERGROUP
+        return f"https://t.me/c/{internal}/{suffix}", kind
 
     if chat is None:
         return None, NO_CHAT_METADATA
     return None, BASIC_GROUP
 
 
-def message_url(chat: Any, message_id: int | None, *, chat_id: int | None = None) -> str | None:
+def message_url(
+    chat: Any,
+    message_id: int | None,
+    *,
+    chat_id: int | None = None,
+    topic_id: int | None = None,
+) -> str | None:
     """Just the URL from :func:`build_message_url`, or ``None``."""
-    return build_message_url(chat, message_id, chat_id=chat_id)[0]
+    return build_message_url(chat, message_id, chat_id=chat_id, topic_id=topic_id)[0]
 
 
 def build_message_link(chat: Any, message_id: int, fallback: str = "-") -> str:

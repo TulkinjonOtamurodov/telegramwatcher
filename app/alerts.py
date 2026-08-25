@@ -37,6 +37,7 @@ from app.utils import (
     build_message_link,
     build_message_url,
     display_name,
+    forum_topic_id,
     render_template,
     split_heading,
     truncate,
@@ -187,14 +188,18 @@ def build_alert(
 
     # One central helper decides the link; here we only report what it decided.
     url, kind = build_message_url(
-        chat, message_id, chat_id=getattr(event, "chat_id", None)
+        chat,
+        message_id,
+        chat_id=getattr(event, "chat_id", None),
+        topic_id=forum_topic_id(message),
     )
     if url:
         logger.info(
-            "Message URL built | group=%s | msg=%s | url_type=%s",
+            "Message URL built | group=%s | msg=%s | url_type=%s | url=%s",
             group_name,
             message_id,
             kind,
+            url,
         )
     else:
         logger.warning(

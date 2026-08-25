@@ -436,12 +436,24 @@ invented for a message that does not have one.
 [ ✅ SEEN — DELETE IN 5 MIN ]
 ```
 
-Public groups give `https://t.me/<username>/<id>`; private supergroups give
-`https://t.me/c/<internal id>/<id>` with the `-100` prefix stripped. Legacy
-basic groups have no link form in Telegram — those alerts arrive with only the
-dismiss button rather than a dead link. Every link is built by one helper,
-`build_message_url()` in `app/utils.py`, which also reports why a link could not
-be made so the reason lands in the log.
+| Chat type | Link |
+| --- | --- |
+| Public group or channel | `t.me/<username>/<id>` |
+| Private supergroup or channel | `t.me/c/<internal id>/<id>` |
+| Inside a forum **topic** | a topic segment is inserted: `t.me/c/<internal id>/<topic id>/<id>` |
+| Legacy basic group | none exists — the alert arrives with only the dismiss button |
+
+The topic segment matters: in a supergroup with **Topics** enabled, a two-part
+link opens the group but does not land on the message. Telethon reports the
+topic through `reply_to.forum_topic`, and `forum_topic_id()` reads it.
+
+Every link is built by one helper, `build_message_url()` in `app/utils.py`,
+which also reports which form it used — or why it could not build one — so both
+land in the log:
+
+```
+Message URL built | group=Dispatch | msg=68044 | url_type=private_supergroup_topic | url=https://t.me/c/1234567890/12/68044
+```
 
 **Tapping SEEN** deletes that alert from your bot chat five minutes later. The
 original group message is never touched. Each recipient's copy is tracked
