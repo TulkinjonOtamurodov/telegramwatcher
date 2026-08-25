@@ -65,6 +65,28 @@ CB_EXC_LIST = b"EL"
 CB_EXC_ADD = b"EA"
 CB_EXC_DEL = b"ED"
 
+# Group rules. Codes that target one chat carry its id after a pipe, e.g.
+# b"G|-1001234567890" -- well inside Telegram's 64-byte callback-data cap.
+CB_GROUPS = b"GR"
+CB_GROUP_PICK = b"GS"
+CB_GROUP_ADD_ID = b"GA"
+CB_SEP = b"|"
+CB_GROUP = b"G"
+CB_G_TOGGLE = b"GT"
+CB_G_IGNORED = b"GI"
+CB_G_EXTRA = b"GE"
+CB_G_DESC = b"GD"
+CB_G_REMOVE = b"GX"
+CB_GI_ADD = b"GIA"
+CB_GI_DEL = b"GIR"
+CB_GI_CLEAR = b"GIC"
+CB_GE_ADD = b"GEA"
+CB_GE_DEL = b"GER"
+CB_GE_CLEAR = b"GEC"
+CB_GD_EDIT = b"GDE"
+CB_GD_CLEAR = b"GDC"
+CB_PICK = b"GP"
+
 _PREVIEW_PREFIX = b"PV"
 
 # -- pending input actions -------------------------------------------------- #
@@ -74,6 +96,12 @@ SET_TEMPLATE = "set_template"
 SET_MAX_CHARS = "set_max_chars"
 EXCLUDE_CHAT = "exclude_chat"
 ALLOW_CHAT = "allow_chat"
+GROUP_ADD_ID = "group_add_id"
+GROUP_IGNORE_ADD = "group_ignore_add"
+GROUP_IGNORE_DEL = "group_ignore_del"
+GROUP_EXTRA_ADD = "group_extra_add"
+GROUP_EXTRA_DEL = "group_extra_del"
+GROUP_DESC = "group_desc"
 
 _PROMPTS: dict[str, str] = {
     ADD_KEYWORD: (
@@ -106,6 +134,36 @@ _PROMPTS: dict[str, str] = {
         "Send the chat id to re-enable keyword alerts for.\n"
         "Tap 📋 Excluded Groups first if you need the id."
     ),
+    GROUP_ADD_ID: (
+        "➕ CONFIGURE A GROUP\n\n"
+        "Send the group's chat id, e.g. -1001234567890.\n\n"
+        "Easier: send /grouprules inside the group itself."
+    ),
+    GROUP_IGNORE_ADD: (
+        "➕ IGNORE A GLOBAL KEYWORD HERE\n\n"
+        "Send the global keyword this group should stop alerting on.\n"
+        "It keeps working in every other group."
+    ),
+    GROUP_IGNORE_DEL: (
+        "➖ STOP IGNORING\n\n"
+        "Send the keyword that should start alerting here again."
+    ),
+    GROUP_EXTRA_ADD: (
+        "➕ GROUP-SPECIFIC KEYWORD\n\n"
+        "Send a keyword or phrase that should alert only in this group.\n"
+        "Examples: lawsuit · fuel card blocked"
+    ),
+    GROUP_EXTRA_DEL: (
+        "➖ REMOVE GROUP KEYWORD\n\n"
+        "Send the group-specific keyword to remove."
+    ),
+    GROUP_DESC: (
+        "✏️ GROUP INSTRUCTION\n\n"
+        "Send the description for this group — what it is used for and how "
+        "MAKIMA should treat it. Multiple lines are fine.\n\n"
+        "It is stored as-is and never parsed into keywords; ignored and "
+        "group-specific words stay explicit."
+    ),
 }
 
 #: Which menu each input flow returns to once it completes.
@@ -118,6 +176,16 @@ _RETURN_VIEW: dict[str, str] = {
     ALLOW_CHAT: "exclusions",
 }
 
+#: Group-scoped flows return to that group's own screen.
+_GROUP_RETURN_VIEW: dict[str, str] = {
+    GROUP_ADD_ID: "group",
+    GROUP_IGNORE_ADD: "gign",
+    GROUP_IGNORE_DEL: "gign",
+    GROUP_EXTRA_ADD: "gext",
+    GROUP_EXTRA_DEL: "gext",
+    GROUP_DESC: "gdesc",
+}
+
 
 @dataclass
 class Pending:
@@ -126,6 +194,8 @@ class Pending:
     action: str
     chat_id: int
     message_id: int
+    #: The group a group-rules flow is configuring, as a chat-id string.
+    target: str = ""
 
 
 class ControlPanel:
@@ -137,12 +207,22 @@ class ControlPanel:
         *,
         actions: MakimaActions,
         is_authorized: Callable[[int | None], bool],
+        group_source: Callable[[], Any] | None = None,
     ) -> None:
         self._bot = bot_client
         self._actions = actions
         self._is_authorized = is_authorized
+        #: Async callable returning [(chat_id, title), ...] for the group picker.
+        #: Supplied by main from the *user* client, which is the only one that
+        #: knows which groups the account is actually in.
+        self._group_source = group_source
         self._pending: dict[int, Pending] = {}
+        #: Titles seen in the last picker render, so a pick can store one.
+        self._picker_titles: dict[str, str] = {}
         self._registered = False
+
+    def set_group_source(self, source: Callable[[], Any] | None) -> None:
+        self._group_source = source
 
     # -- lifecycle --------------------------------------------------------- #
     def register(self) -> None:
@@ -180,9 +260,7 @@ class ControlPanel:
             ],
             [
                 Button.inline(f"📏 Preview: {act.max_chars}", CB_PREVIEW),
-                Button.inline(
-                    f"🚫 Exclusions: {act.excluded_count()}", CB_EXCLUSIONS
-                ),
+                Button.inline(f"🏢 Group Rules: {act.rules_count()}", CB_GROUPS),
             ],
             [Button.inline("🔄 Reload", CB_RELOAD)],
         ]
@@ -199,6 +277,94 @@ class ControlPanel:
                 Button.inline("⬅️ Back", CB_MAIN),
             ],
         ]
+
+    # -- group-rules keyboards ---------------------------------------------- #
+    @staticmethod
+    def _target(code: bytes, chat_id: Any) -> bytes:
+        return code + CB_SEP + str(chat_id).encode()
+
+    def _groups_keyboard(self) -> list[list[Any]]:
+        rows: list[list[Any]] = []
+        for rule in self._actions.group_rules.all() if self._actions.group_rules else []:
+            state = "✅" if rule.keywords_enabled else "🚫"
+            label = rule.display_title
+            if len(label) > 28:
+                label = label[:27] + "…"
+            rows.append(
+                [Button.inline(f"{state} {label}", self._target(CB_GROUP, rule.chat_id))]
+            )
+        rows.append(
+            [
+                Button.inline("📂 Pick a group", CB_GROUP_PICK),
+                Button.inline("🔢 By chat ID", CB_GROUP_ADD_ID),
+            ]
+        )
+        rows.append([Button.inline("⬅️ Back", CB_MAIN)])
+        return rows
+
+    def _group_keyboard(self, chat_id: str) -> list[list[Any]]:
+        rule = self._actions.get_rule(chat_id)
+        enabled = rule.keywords_enabled if rule else True
+        state = "✅ KEYWORDS: ON" if enabled else "🚫 KEYWORDS: OFF"
+        return [
+            [
+                Button.inline(state, self._target(CB_G_TOGGLE, chat_id)),
+                Button.inline("🚫 Ignored Words", self._target(CB_G_IGNORED, chat_id)),
+            ],
+            [
+                Button.inline("➕ Extra Keywords", self._target(CB_G_EXTRA, chat_id)),
+                Button.inline("📝 Description", self._target(CB_G_DESC, chat_id)),
+            ],
+            [
+                Button.inline("🗑 Remove Rules", self._target(CB_G_REMOVE, chat_id)),
+                Button.inline("⬅️ Back", CB_GROUPS),
+            ],
+        ]
+
+    def _list_keyboard(
+        self, chat_id: str, add: bytes, remove: bytes, clear: bytes
+    ) -> list[list[Any]]:
+        return [
+            [
+                Button.inline("➕ Add", self._target(add, chat_id)),
+                Button.inline("➖ Remove", self._target(remove, chat_id)),
+            ],
+            [
+                Button.inline("🧹 Clear", self._target(clear, chat_id)),
+                Button.inline("⬅️ Back", self._target(CB_GROUP, chat_id)),
+            ],
+        ]
+
+    def _description_keyboard(self, chat_id: str) -> list[list[Any]]:
+        return [
+            [
+                Button.inline("✏️ Edit", self._target(CB_GD_EDIT, chat_id)),
+                Button.inline("🗑 Clear", self._target(CB_GD_CLEAR, chat_id)),
+            ],
+            [Button.inline("⬅️ Back", self._target(CB_GROUP, chat_id))],
+        ]
+
+    async def _picker_keyboard(self) -> list[list[Any]]:
+        """Groups the watching account is actually in, straight from Telethon."""
+        rows: list[list[Any]] = []
+        if self._group_source is not None:
+            try:
+                self._picker_titles.clear()
+                for chat_id, title in await self._group_source():
+                    self._picker_titles[str(chat_id)] = title
+                    label = title if len(title) <= 30 else title[:29] + "…"
+                    rows.append(
+                        [Button.inline(label, self._target(CB_PICK, chat_id))]
+                    )
+            except Exception:
+                logger.exception("Could not list the account's groups")
+        rows.append(
+            [
+                Button.inline("🔢 By chat ID", CB_GROUP_ADD_ID),
+                Button.inline("⬅️ Back", CB_GROUPS),
+            ]
+        )
+        return rows
 
     @staticmethod
     def _back_keyboard() -> list[list[Any]]:
@@ -245,9 +411,51 @@ class ControlPanel:
 
     # -- views ------------------------------------------------------------- #
     def _view(self, name: str, note: str = "") -> tuple[str, list[list[Any]]]:
-        """Return the (text, keyboard) pair for one menu."""
+        """Return the (text, keyboard) pair for one menu.
+
+        A group-scoped view is named ``"<view>:<chat id>"``.
+        """
         act = self._actions
+        name, _, target = name.partition(":")
         prefix = f"{note}\n\n" if note else ""
+
+        if name == "groups":
+            return prefix + act.group_rules_text(), self._groups_keyboard()
+
+        if name == "group":
+            return prefix + act.group_detail_text(target), self._group_keyboard(target)
+
+        if name == "gign":
+            rule = act.get_rule(target)
+            words = rule.ignored_keywords if rule else []
+            body = (
+                "🚫 IGNORED IN THIS GROUP\n\n"
+                + ("\n".join(words) if words else "(none)")
+                + "\n\nThese global keywords do not alert here. They keep "
+                "working everywhere else."
+            )
+            return prefix + body, self._list_keyboard(
+                target, CB_GI_ADD, CB_GI_DEL, CB_GI_CLEAR
+            )
+
+        if name == "gext":
+            rule = act.get_rule(target)
+            words = rule.extra_keywords if rule else []
+            body = (
+                "➕ GROUP-SPECIFIC KEYWORDS\n\n"
+                + ("\n".join(words) if words else "(none)")
+                + "\n\nThese alert only in this group, whether or not they are "
+                "in the global list."
+            )
+            return prefix + body, self._list_keyboard(
+                target, CB_GE_ADD, CB_GE_DEL, CB_GE_CLEAR
+            )
+
+        if name == "gdesc":
+            rule = act.get_rule(target)
+            description = (rule.description if rule else "") or "(none set)"
+            body = f"📝 GROUP INSTRUCTION\n\n{description}"
+            return prefix + body, self._description_keyboard(target)
 
         if name == "status":
             return prefix + act.status_text(), self._back_keyboard()
@@ -301,6 +509,38 @@ class ControlPanel:
             logger.warning("Flood wait (%ss) while sending the panel", exc.seconds)
         except RPCError:
             logger.exception("Telegram rejected the control panel message")
+
+    async def send_group_panel(self, event: Any, chat_id: str) -> None:
+        """Reply with one group's configuration screen."""
+        text, buttons = self._view(f"group:{chat_id}")
+        try:
+            await event.respond(
+                truncate(text, MAX_PANEL_CHARS),
+                buttons=buttons,
+                link_preview=False,
+                parse_mode=None,
+            )
+        except RPCError:
+            logger.exception("Could not send the group panel")
+
+    async def send_group_panel_to(self, recipient: int, chat_id: str) -> None:
+        """Push a group's configuration screen into an admin's private chat.
+
+        Used when ``/grouprules`` is typed inside the group itself: the answer
+        goes to the private chat so nothing configuration-related is posted
+        where the rest of the group can see it.
+        """
+        text, buttons = self._view(f"group:{chat_id}")
+        try:
+            await self._bot.send_message(
+                recipient,
+                truncate(text, MAX_PANEL_CHARS),
+                buttons=buttons,
+                link_preview=False,
+                parse_mode=None,
+            )
+        except RPCError:
+            logger.info("Could not send the group panel to %s", recipient, exc_info=True)
 
     # -- callback handling -------------------------------------------------- #
     async def _on_callback(self, event: Any) -> None:
@@ -420,12 +660,135 @@ class ControlPanel:
             )
             return
 
+        # --- group rules ---
+        if data == CB_GROUPS:
+            self._pending.pop(sender_id, None)
+            await self._answer(event)
+            await self._render(event, *self._view("groups"))
+            return
+
+        if data == CB_GROUP_PICK:
+            self._pending.pop(sender_id, None)
+            await self._answer(event)
+            body = (
+                "📂 PICK A GROUP\n\n"
+                "Groups this account is in. Choose the one to configure."
+            )
+            await self._render(event, body, await self._picker_keyboard())
+            return
+
+        if data == CB_GROUP_ADD_ID:
+            await self._begin_input(event, sender_id, GROUP_ADD_ID)
+            return
+
+        code, _, raw_target = data.partition(CB_SEP)
+        target = raw_target.decode("utf-8", "ignore")
+        if target:
+            handled = await self._dispatch_group(event, sender_id, code, target)
+            if handled:
+                return
+
         # --- anything else is a stale button from an older version ---
         logger.info("Unknown callback data %r from %s", data, sender_id)
         await self._answer(event, "Menu refreshed")
         await self._render(event, *self._view("main", "This menu was out of date."))
 
-    async def _begin_input(self, event: Any, sender_id: int, action: str) -> None:
+    async def _dispatch_group(
+        self, event: Any, sender_id: int, code: bytes, target: str
+    ) -> bool:
+        """Handle every callback that names one group. True if it was ours."""
+        act = self._actions
+
+        navigation = {
+            CB_GROUP: "group",
+            CB_G_IGNORED: "gign",
+            CB_G_EXTRA: "gext",
+            CB_G_DESC: "gdesc",
+        }
+        if code in navigation:
+            self._pending.pop(sender_id, None)
+            await self._answer(event)
+            await self._render(event, *self._view(f"{navigation[code]}:{target}"))
+            return True
+
+        if code == CB_PICK:
+            # Chosen from the picker: create the rule, then open its screen.
+            try:
+                await act.ensure_group(target, self._picker_titles.get(target, ""))
+            except ActionError as exc:
+                await self._answer(event, f"⚠️ {exc}", alert=True)
+                return True
+            await self._answer(event, "Configured")
+            await self._render(event, *self._view(f"group:{target}"))
+            return True
+
+        if code == CB_G_TOGGLE:
+            try:
+                enabled = await act.toggle_group_keywords(target)
+            except ActionError as exc:
+                await self._answer(event, f"⚠️ {exc}", alert=True)
+                return True
+            await self._answer(event, f"Keywords: {on_off(enabled)}")
+            await self._render(event, *self._view(f"group:{target}"))
+            return True
+
+        if code == CB_G_REMOVE:
+            try:
+                title = await act.remove_group(target)
+            except ActionError as exc:
+                await self._answer(event, f"⚠️ {exc}", alert=True)
+                return True
+            await self._answer(event, "Rules removed")
+            await self._render(
+                event, *self._view("groups", f"🗑 Rules removed for {title}.")
+            )
+            return True
+
+        clears = {
+            CB_GI_CLEAR: ("ignored_keywords", "gign"),
+            CB_GE_CLEAR: ("extra_keywords", "gext"),
+        }
+        if code in clears:
+            attr, view = clears[code]
+            try:
+                removed = await act.clear_group_list(target, attr)
+            except ActionError as exc:
+                await self._answer(event, f"⚠️ {exc}", alert=True)
+                return True
+            await self._answer(event, f"Cleared {removed}")
+            await self._render(
+                event, *self._view(f"{view}:{target}", f"🧹 Cleared {removed} entr(ies).")
+            )
+            return True
+
+        if code == CB_GD_CLEAR:
+            try:
+                await act.set_group_description(target, "", sender_id)
+            except ActionError as exc:
+                await self._answer(event, f"⚠️ {exc}", alert=True)
+                return True
+            await self._answer(event, "Description cleared")
+            await self._render(
+                event, *self._view(f"gdesc:{target}", "🗑 Description cleared.")
+            )
+            return True
+
+        prompts = {
+            CB_GI_ADD: GROUP_IGNORE_ADD,
+            CB_GI_DEL: GROUP_IGNORE_DEL,
+            CB_GE_ADD: GROUP_EXTRA_ADD,
+            CB_GE_DEL: GROUP_EXTRA_DEL,
+            CB_GD_EDIT: GROUP_DESC,
+        }
+        if code in prompts:
+            await self._begin_input(event, sender_id, prompts[code], target=target)
+            return True
+
+        return False
+
+    async def _begin_input(
+        self, event: Any, sender_id: int, action: str, target: str = ""
+    ) -> None:
         """Switch the panel into a prompt and wait for the admin's next message."""
         chat_id = getattr(event, "chat_id", None)
         message_id = getattr(event, "message_id", None)
@@ -436,7 +799,7 @@ class ControlPanel:
             await self._answer(event, "⚠️ Could not start that.", alert=True)
             return
 
-        self._pending[sender_id] = Pending(action, int(chat_id), int(message_id))
+        self._pending[sender_id] = Pending(action, int(chat_id), int(message_id), target)
         await self._answer(event)
         await self._render(event, _PROMPTS[action], self._cancel_keyboard())
 
@@ -501,6 +864,30 @@ class ControlPanel:
             elif action == ALLOW_CHAT:
                 label = await act.allow_chat(raw.strip())
                 note = f"✅ Keyword alerts enabled for {label}."
+            elif action == GROUP_ADD_ID:
+                rule = await act.ensure_group(raw.strip())
+                pending.target = rule.chat_id
+                note = f"✅ Configuring {rule.display_title}."
+            elif action == GROUP_IGNORE_ADD:
+                keyword, is_global = await act.add_ignored(pending.target, raw)
+                note = f"✅ '{keyword}' is now ignored in this group."
+                if not is_global:
+                    note += (
+                        f"\n\n⚠️ '{keyword}' is not currently a global keyword, so "
+                        "this has no effect until it is added to the global list."
+                    )
+            elif action == GROUP_IGNORE_DEL:
+                keyword = await act.remove_ignored(pending.target, raw)
+                note = f"✅ '{keyword}' alerts here again."
+            elif action == GROUP_EXTRA_ADD:
+                keyword = await act.add_group_keyword(pending.target, raw)
+                note = f"✅ '{keyword}' now alerts in this group only."
+            elif action == GROUP_EXTRA_DEL:
+                keyword = await act.remove_group_keyword(pending.target, raw)
+                note = f"✅ Removed '{keyword}'."
+            elif action == GROUP_DESC:
+                await act.set_group_description(pending.target, raw, sender_id)
+                note = "✅ Description saved."
             else:  # pragma: no cover - guarded by _RETURN_VIEW
                 self._pending.pop(sender_id, None)
                 return
@@ -515,8 +902,16 @@ class ControlPanel:
             return
 
         self._pending.pop(sender_id, None)
-        text, buttons = self._view(_RETURN_VIEW[action], note)
+        text, buttons = self._view(self._return_view(action, pending.target), note)
         await self._edit_pending(pending, text, buttons)
+
+    @staticmethod
+    def _return_view(action: str, target: str) -> str:
+        """Where a completed input flow lands. Group flows return to that group."""
+        scoped = _GROUP_RETURN_VIEW.get(action)
+        if scoped:
+            return f"{scoped}:{target}"
+        return _RETURN_VIEW.get(action, "main")
 
     # -- Telegram plumbing -------------------------------------------------- #
     async def _render(self, event: Any, text: str, buttons: list[list[Any]]) -> None:

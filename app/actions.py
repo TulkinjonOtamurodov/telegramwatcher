@@ -15,6 +15,7 @@ import time
 from typing import Any
 
 from app.ai_classifier import has_backend
+from app.group_rules import describe_all, describe_rule
 from app.keywords import KeywordError, KeywordStore
 from app.logging_config import get_logger
 from app.settings import (
@@ -77,22 +78,6 @@ def on_off(value: bool) -> str:
     return "ON" if value else "OFF"
 
 
-# Module-level readers so the watcher can check exclusions without depending on
-# the whole command/panel object graph.
-def excluded_chats_from(settings: SettingsStore) -> dict[str, str]:
-    raw = settings.get("keyword_excluded_chats", {})
-    if not isinstance(raw, dict):
-        return {}
-    return {str(key): str(value) for key, value in raw.items()}
-
-
-def is_chat_excluded(settings: SettingsStore, chat_id: Any) -> bool:
-    """True when keyword matching should be skipped for this chat."""
-    if chat_id is None:
-        return False
-    return str(chat_id) in excluded_chats_from(settings)
-
-
 class MakimaActions:
     """Every state change and every rendered view, in one place."""
 
@@ -104,6 +89,7 @@ class MakimaActions:
         watcher: Any = None,
         dispatcher: Any = None,
         watched: Any = None,
+        group_rules: Any = None,
         identity: dict[str, Any] | None = None,
     ) -> None:
         self.settings = settings
@@ -111,6 +97,7 @@ class MakimaActions:
         self.watcher = watcher
         self.dispatcher = dispatcher
         self.watched = watched
+        self.group_rules = group_rules
         self.identity = identity or {}
         self._started_at = time.monotonic()
 
@@ -199,68 +186,124 @@ class MakimaActions:
         await self.settings.set("alerts.template", DEFAULT_TEMPLATE)
         logger.info("Alert template reset to the default")
 
-    # -- keyword exclusions ------------------------------------------------- #
+    # -- group rules --------------------------------------------------------- #
     #
-    # Excluding a chat suppresses *keyword* matching there and nothing else.
-    # Mentions and replies still raise alerts, so a noisy group stays watched
-    # for the things that actually need you.
+    # A group rule only ever affects *keyword* matching in that one chat.
+    # Mentions and replies are evaluated before any of this and are untouched.
 
-    def excluded_chats(self) -> dict[str, str]:
-        """``{"-1001234567890": "Claims Discussion"}`` -- ids are the key."""
-        return excluded_chats_from(self.settings)
+    def rules_count(self) -> int:
+        return self.group_rules.count() if self.group_rules else 0
 
-    def is_chat_excluded(self, chat_id: Any) -> bool:
-        return is_chat_excluded(self.settings, chat_id)
+    def keyword_disabled_count(self) -> int:
+        return self.group_rules.disabled_count() if self.group_rules else 0
+
+    def get_rule(self, chat_id: Any) -> Any:
+        return self.group_rules.get(chat_id) if self.group_rules else None
+
+    def _require_store(self) -> Any:
+        if self.group_rules is None:  # pragma: no cover - always wired in main
+            raise ActionError("Group rules are not available.")
+        return self.group_rules
+
+    async def ensure_group(self, chat_id: Any, title: str = "") -> Any:
+        try:
+            return await self._require_store().ensure(chat_id, title)
+        except KeywordError as exc:
+            raise ActionError(str(exc)) from exc
+
+    async def remove_group(self, chat_id: Any) -> str:
+        try:
+            return await self._require_store().remove(chat_id)
+        except KeywordError as exc:
+            raise ActionError(str(exc)) from exc
+
+    async def toggle_group_keywords(self, chat_id: Any) -> bool:
+        try:
+            return await self._require_store().toggle_keywords(chat_id)
+        except KeywordError as exc:
+            raise ActionError(str(exc)) from exc
+
+    async def add_ignored(self, chat_id: Any, word: str) -> tuple[str, bool]:
+        """Ignore a global keyword here. Also reports whether it is global."""
+        try:
+            keyword = await self._require_store().add_ignored(chat_id, word)
+        except KeywordError as exc:
+            raise ActionError(str(exc)) from exc
+        return keyword, keyword in self.keywords
+
+    async def remove_ignored(self, chat_id: Any, word: str) -> str:
+        try:
+            return await self._require_store().remove_ignored(chat_id, word)
+        except KeywordError as exc:
+            raise ActionError(str(exc)) from exc
+
+    async def add_group_keyword(self, chat_id: Any, word: str) -> str:
+        try:
+            return await self._require_store().add_extra(chat_id, word)
+        except KeywordError as exc:
+            raise ActionError(str(exc)) from exc
+
+    async def remove_group_keyword(self, chat_id: Any, word: str) -> str:
+        try:
+            return await self._require_store().remove_extra(chat_id, word)
+        except KeywordError as exc:
+            raise ActionError(str(exc)) from exc
+
+    async def clear_group_list(self, chat_id: Any, attr: str) -> int:
+        try:
+            return await self._require_store().clear_list(chat_id, attr)
+        except KeywordError as exc:
+            raise ActionError(str(exc)) from exc
+
+    async def set_group_description(
+        self, chat_id: Any, text: str, admin: Any = None
+    ) -> str:
+        try:
+            return await self._require_store().set_description(chat_id, text, admin)
+        except KeywordError as exc:
+            raise ActionError(str(exc)) from exc
+
+    def group_rules_text(self) -> str:
+        return describe_all(self.group_rules.all()) if self.group_rules else describe_all([])
+
+    def group_detail_text(self, chat_id: Any) -> str:
+        return describe_rule(self.get_rule(chat_id), chat_id)
+
+    # -- backward-compatible whole-group exclusion --------------------------- #
+    # /excludekeywords and /allowkeywords predate group rules; they now set the
+    # keywords_enabled flag so there is only one source of truth.
 
     def excluded_count(self) -> int:
-        return len(self.excluded_chats())
+        return self.keyword_disabled_count()
+
+    def is_chat_excluded(self, chat_id: Any) -> bool:
+        rule = self.get_rule(chat_id)
+        return rule is not None and not rule.keywords_enabled
 
     async def exclude_chat(self, chat_id: Any, title: str = "") -> str:
-        """Stop keyword matching in one chat. Returns the stored title."""
-        key = self._normalize_chat_id(chat_id)
-        current = self.excluded_chats()
-        if key in current:
-            raise ActionError("Keyword alerts are already disabled for that group.")
-        label = str(title).strip() or f"Chat {key}"
-        current[key] = label
-        await self.settings.set("keyword_excluded_chats", current)
-        logger.info("Keyword exclusion added | chat=%s | group=%s", key, label)
-        return label
+        store = self._require_store()
+        try:
+            rule = await store.ensure(chat_id, title)
+            if not rule.keywords_enabled:
+                raise ActionError("Keyword alerts are already disabled for that group.")
+            await store.set_keywords_enabled(chat_id, False)
+        except KeywordError as exc:
+            raise ActionError(str(exc)) from exc
+        return rule.display_title
 
     async def allow_chat(self, chat_id: Any) -> str:
-        """Resume keyword matching in one chat. Returns the removed title."""
-        key = self._normalize_chat_id(chat_id)
-        current = self.excluded_chats()
-        if key not in current:
-            raise ActionError("Keyword alerts are not disabled for that group.")
-        label = current.pop(key)
-        await self.settings.set("keyword_excluded_chats", current)
-        logger.info("Keyword exclusion removed | chat=%s | group=%s", key, label)
-        return label
-
-    @staticmethod
-    def _normalize_chat_id(chat_id: Any) -> str:
-        text = str(chat_id).strip()
-        if not text.lstrip("-").isdigit():
-            raise ActionError(
-                f"'{text}' is not a Telegram chat id. Ids look like -1001234567890."
-            )
-        return text
+        store = self._require_store()
+        try:
+            rule = store.get(chat_id)
+            if rule is None or rule.keywords_enabled:
+                raise ActionError("Keyword alerts are not disabled for that group.")
+            await store.set_keywords_enabled(chat_id, True)
+        except KeywordError as exc:
+            raise ActionError(str(exc)) from exc
+        return rule.display_title
 
     def exclusions_text(self) -> str:
-        excluded = self.excluded_chats()
-        if not excluded:
-            return (
-                "🚫 KEYWORD EXCLUSIONS (0)\n\n"
-                "No groups are excluded. Keyword alerts are active everywhere.\n\n"
-                "Send /excludekeywords inside a noisy group to silence keyword "
-                "alerts there. Mentions and replies keep working."
-            )
-        lines = [f"🚫 KEYWORD EXCLUSIONS ({len(excluded)})", ""]
-        for chat_id, title in excluded.items():
-            lines.append(f"- {title}\n  {chat_id}")
-        lines += ["", "Mentions and replies still alert in these groups."]
-        return "\n".join(lines)
+        return self.group_rules_text()
 
     async def reload(self) -> None:
         """Re-read every data file from disk without restarting the process."""
@@ -268,6 +311,8 @@ class MakimaActions:
         await self.keywords.load()
         if self.watched is not None:
             await self.watched.load()
+        if self.group_rules is not None:
+            await self.group_rules.load()
         logger.info("Reloaded settings and %d keywords from disk", self.keywords.count())
 
     # -- rendered views ---------------------------------------------------- #
@@ -281,7 +326,8 @@ class MakimaActions:
             f"Keywords: {on_off(settings.watch_keywords)}",
             f"Keywords loaded: {self.keywords.count()}",
             f"Watched members: {self.watched.count() if self.watched else 0}",
-            f"Keyword-excluded groups: {self.excluded_count()}",
+            f"Group rules: {self.rules_count()} configured",
+            f"Keyword-disabled groups: {self.keyword_disabled_count()}",
             f"Max preview chars: {settings.max_message_chars}",
             f"AI classification: {on_off(settings.ai_enabled)}"
             + (

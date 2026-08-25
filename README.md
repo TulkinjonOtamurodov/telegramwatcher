@@ -41,7 +41,7 @@ Private MAKIMA Alerts
 - [Configuration files](#configuration-files)
 - [Alert format](#alert-format)
 - [Watched members](#watched-members)
-- [Keyword exclusions](#keyword-exclusions)
+- [Group rules](#group-rules)
 - [Alert lifecycle](#alert-lifecycle)
 - [Hostinger VPS deployment](#hostinger-vps-deployment)
 - [Updating](#updating)
@@ -64,8 +64,9 @@ Private MAKIMA Alerts
 - **Watched members** — tag alerts with the person mentioned (`#THOMAS`), kept
   separate from the admin list.
 - **One-tap deep links** — every alert carries an inline OPEN MESSAGE button.
-- **Per-group keyword exclusions** — silence keyword alerts in noisy groups
-  while mentions and replies keep working.
+- **Per-group keyword rules** — ignore noisy global keywords in one group, add
+  group-only keywords, or switch keyword matching off there entirely. Mentions
+  and replies always keep working.
 - **Self-clearing alerts** — tap SEEN and the alert removes itself after five
   minutes.
 - **Private bot control panel** — add and remove keywords, flip modes, change
@@ -161,7 +162,8 @@ settemplate - Replace the alert template
 reload - Re-read keywords and settings
 excludekeywords - Silence keyword alerts for a group
 allowkeywords - Re-enable keyword alerts for a group
-keywordexclusions - List keyword-excluded groups
+keywordexclusions - List configured group rules
+grouprules - Per-group keyword rules
 ```
 
 To revoke a leaked token: BotFather → `/mybots` → your bot → **API Token** →
@@ -283,14 +285,14 @@ Watcher controls and alert settings.
 [ 📊 Status        ] [ 🔑 Keywords      ]
 [ 👤 Mentions: ON  ] [ ↩️ Replies: ON   ]
 [ 🎯 Keywords: ON  ] [ 📝 Template      ]
-[ 📏 Preview: 500  ] [ 🚫 Exclusions: 0 ]
+[ 📏 Preview: 500  ] [ 🏢 Group Rules: 0 ]
 [ 🔄 Reload        ]
 ```
 
 The three mode buttons show live state and toggle on tap. **Keywords** opens an
 add/remove menu, **Template** lets you replace or reset the alert format,
-**Preview** offers 200/500/1000/2000 or a custom value, and **Exclusions**
-manages the groups where keyword matching is skipped.
+**Preview** offers 200/500/1000/2000 or a custom value, and **Group Rules**
+configures per-group keyword behaviour.
 
 Buttons that need typed input (add or remove a keyword, a new template, a custom
 preview length) prompt you and consume your next message, with a **❌ Cancel**
@@ -316,7 +318,8 @@ the panel persist identically. The commands below all still work.
 | `/reload` | Re-reads `keywords.txt` and `watcher_settings.json` from disk without restarting |
 | `/excludekeywords` | Run **inside a group** to silence keyword alerts there. From private chat, pass a chat id |
 | `/allowkeywords` | Undo it, in the group or by id |
-| `/keywordexclusions` | List the excluded groups with their ids |
+| `/keywordexclusions` | List the configured group rules |
+| `/grouprules` | Run **inside a group** to configure it. In private chat, lists configured groups |
 
 Example `/status` output:
 
@@ -593,6 +596,111 @@ like every other setting. The keyword list itself stays global in
 `data/keywords.txt` — there are no per-group keyword lists.
 
 `/status` shows the count; the full list lives in `/keywordexclusions`.
+
+---
+
+## Group rules
+
+The global list in `data/keywords.txt` still applies everywhere. A group rule
+layers on top of it, for one chat only:
+
+| Field | Effect |
+| --- | --- |
+| `keywords_enabled` | Master switch. `false` skips **all** keyword matching in that group |
+| `ignored_keywords` | Global keywords that do not fire *here*. They keep working everywhere else |
+| `extra_keywords` | Keywords that fire *only* here, whether or not they are global |
+| `description` | Free text explaining the group. Stored verbatim, never parsed |
+
+**Mentions and replies are never affected by any of this.** They are evaluated
+before keyword matching even starts, so a group with keywords switched off is
+still fully watched for the things that need you.
+
+### Evaluation order
+
+For every incoming group message:
+
+1. Mentions checked — independent of group rules.
+2. Replies checked — independent of group rules.
+3. If the global **Keywords** mode is off → no keyword matching at all.
+4. If this group's `keywords_enabled` is false → no keyword matching **here**.
+5. Otherwise: global keywords **minus** this group's `ignored_keywords`.
+6. Plus this group's `extra_keywords`.
+7. Both matched in one pass by the same engine, so duplicates and overlapping
+   phrases resolve exactly as they always did.
+8. Alert if mention **or** reply **or** at least one keyword survived.
+
+A group with no rule behaves exactly as before — the full global list.
+
+### Example: a noisy claims group
+
+Global keywords include `claim`, `insurance`, `damage`, `permit`.
+
+| Message in that group | Result |
+| --- | --- |
+| "We received the insurance document." | no alert — `insurance` is ignored here |
+| "The permit was denied." | alerts, trigger `PERMIT` |
+| "@you please check the insurance." | alerts — **mention**, ignore list is irrelevant |
+| "insurance claim and damage to the permit" | alerts, trigger `PERMIT` only |
+| "Speak to the attorney" (group-specific) | alerts, trigger `ATTORNEY` |
+
+### Configuring a group
+
+Easiest: send this **inside the group**, from the account MAKIMA watches with:
+
+```
+/grouprules
+```
+
+The chat id comes off that message, and the configuration screen is delivered to
+your private bot chat — nothing appears in the group.
+
+From the panel: `/start` → **🏢 Group Rules** → pick from the list of groups the
+account is in, or enter a chat id. Each group's screen offers:
+
+```
+[ ✅ KEYWORDS: ON  ] [ 🚫 Ignored Words ]
+[ ➕ Extra Keywords ] [ 📝 Description   ]
+[ 🗑 Remove Rules  ] [ ⬅️ Back          ]
+```
+
+**Ignored Words** and **Extra Keywords** each have Add / Remove / Clear. Adding
+an ignored word that is not currently a global keyword is allowed but warns you,
+since it has no effect until that word joins the global list.
+
+**Description** is a free-text instruction — what the group is for and why its
+rules exist:
+
+> This group is used by our safety department. Insurance, claim, damage,
+> inspection and violation appear in ordinary conversation here. Do not treat
+> those words alone as unusual. Direct mentions and replies are still important.
+
+It is stored exactly as written and **never parsed into keywords**. Ignored and
+group-specific words stay explicit structured fields, so behaviour is never
+ambiguous. The optional AI layer can consume it later; nothing does today.
+
+### Storage
+
+`data/group_rules.json`, keyed by Telegram chat id — titles change, ids do not:
+
+```json
+{
+  "group_rules": {
+    "-1001234567890": {
+      "title": "Claims Department",
+      "keywords_enabled": true,
+      "ignored_keywords": ["claim", "damage", "insurance"],
+      "extra_keywords": ["attorney", "lawsuit"],
+      "description": "Claims terminology is normal here."
+    }
+  }
+}
+```
+
+On the Docker volume, so it survives restart, rebuild, reboot and redeploy.
+`/reload` re-reads it. `/status` shows counts only; `/grouprules` lists them.
+
+If you used the earlier `keyword_excluded_chats` setting, it is folded into
+group rules as `keywords_enabled: false` on first start. No manual migration.
 
 ---
 
@@ -992,6 +1100,7 @@ telegram-watcher/
 │   ├── alerts.py             # alert formatting + delivery queue
 │   ├── alert_lifecycle.py    # dismiss button and deletion timers
 │   ├── keywords.py           # keyword storage and matching
+│   ├── group_rules.py        # per-group keyword rules and instructions
 │   ├── watched_users.py      # watched members and mention matching
 │   ├── settings.py           # settings with deep-merge and atomic writes
 │   ├── utils.py              # links, templates, atomic file writes

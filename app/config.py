@@ -101,6 +101,10 @@ class Config:
         return self.data_dir / "watched_users.json"
 
     @property
+    def group_rules_file(self) -> Path:
+        return self.data_dir / "group_rules.json"
+
+    @property
     def defaults_dir(self) -> Path:
         return self.data_dir / "defaults"
 

@@ -8,6 +8,7 @@ touching the network.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from typing import Any
 
@@ -15,7 +16,6 @@ from telethon import events
 from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.types import MessageEntityMentionName
 
-from app.actions import is_chat_excluded
 from app.ai_classifier import classify_message
 from app.alerts import (
     REASON_MENTION,
@@ -24,7 +24,7 @@ from app.alerts import (
     build_alert,
     keyword_reason,
 )
-from app.keywords import KeywordStore
+from app.keywords import KeywordStore, find_hits_in
 from app.logging_config import get_logger
 from app.settings import SettingsStore
 from app.utils import display_name
@@ -35,7 +35,7 @@ logger = get_logger("watcher")
 #: user client because that is the only client actually in those groups -- the
 #: bot never joins one, and that separation is deliberate.
 GROUP_COMMAND_RE = re.compile(
-    r"^/(excludekeywords|allowkeywords)(?:@[\w_]+)?\s*$", re.IGNORECASE
+    r"^/(excludekeywords|allowkeywords|grouprules)(?:@[\w_]+)?\s*$", re.IGNORECASE
 )
 
 
@@ -50,12 +50,14 @@ class Watcher:
         keywords: KeywordStore,
         dispatcher: AlertDispatcher,
         watched: Any = None,
+        group_rules: Any = None,
     ) -> None:
         self._client = user_client
         self._settings = settings
         self._keywords = keywords
         self._dispatcher = dispatcher
         self._watched = watched
+        self._group_rules = group_rules
 
         self._me_id: int | None = None
         self._me_username: str | None = None
@@ -149,6 +151,48 @@ class Watcher:
             return False
         return getattr(replied, "sender_id", None) == self._me_id
 
+    # -- keyword matching ---------------------------------------------------- #
+    def _match_keywords(self, text: str, chat_id: Any) -> list[str]:
+        """Global keywords minus this group's ignores, plus its own keywords.
+
+        With no rule for the chat, this is exactly the previous behaviour: the
+        full global list, matched by the same engine.
+        """
+        if self._group_rules is None:
+            return self._keywords.find_hits(text)
+
+        patterns, rule = self._group_rules.effective_patterns(
+            chat_id, self._keywords.patterns_excluding
+        )
+
+        if rule is not None and not rule.keywords_enabled:
+            logger.debug("Keyword matching disabled for group | chat=%s", chat_id)
+            return []
+
+        hits = find_hits_in(text, patterns)
+
+        if rule is not None:
+            for hit in hits:
+                if hit in rule.extra_patterns:
+                    logger.info(
+                        "Group keyword matched | chat=%s | keyword=%s", chat_id, hit
+                    )
+            # Only worth the second pass when someone is actually reading DEBUG.
+            if rule.ignored_keywords and logger.isEnabledFor(logging.DEBUG):
+                ignored = {
+                    word: pattern
+                    for word, pattern in self._keywords.patterns.items()
+                    if word in set(rule.ignored_keywords)
+                }
+                for word in find_hits_in(text, ignored):
+                    logger.debug(
+                        "Keyword ignored by group rule | chat=%s | keyword=%s",
+                        chat_id,
+                        word,
+                    )
+
+        return hits
+
     # -- in-group exclusion commands ---------------------------------------- #
     async def _on_group_command(self, event: Any) -> None:
         """Apply ``/excludekeywords`` or ``/allowkeywords`` typed in a group.
@@ -229,18 +273,13 @@ class Watcher:
         if settings.watch_replies and await self._is_reply_to_me(event):
             reasons.append(REASON_REPLY)
 
-        # A keyword-excluded chat skips keyword matching only. The mention and
+        # Keyword matching is the only thing group rules touch. The mention and
         # reply checks above already ran, so those still alert normally.
         keyword_hits: list[str] = []
         chat_id = getattr(event, "chat_id", None)
-        if settings.watch_keywords and text and is_chat_excluded(settings, chat_id):
-            logger.debug(
-                "Keyword matching skipped | chat=%s | group=%s",
-                chat_id,
-                display_name(getattr(event, "chat", None), fallback="?"),
-            )
-        elif settings.watch_keywords and text:
-            keyword_hits = self._keywords.find_hits(text)
+        if settings.watch_keywords and text:
+            keyword_hits = self._match_keywords(text, chat_id)
+        if keyword_hits:
             # The full hit list still drives the "+N more" counter in the alert;
             # only the reason line is capped, so it cannot run away.
             reasons.extend(

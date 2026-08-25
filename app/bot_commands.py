@@ -43,9 +43,9 @@ _ON_OFF = {"on": True, "off": False, "true": True, "false": False, "1": True, "0
 HELP_NOTE = (
     "Slash commands still work as well: /status /keywords /addkeyword "
     "/removekeyword /setmentions /setreplies /setkeywords /setmaxchars "
-    "/template /settemplate /reload /keywordexclusions\n\n"
-    "To silence keyword alerts in a noisy group, send /excludekeywords inside "
-    "that group (and /allowkeywords to undo it)."
+    "/template /settemplate /reload /grouprules\n\n"
+    "Send /grouprules inside a group to configure that group's keyword rules — "
+    "ignored words, group-only keywords, and its description."
 )
 
 
@@ -82,7 +82,12 @@ COMMANDS: tuple[Command, ...] = (
     Command(
         "keywordexclusions",
         "/keywordexclusions",
-        "List the keyword-excluded groups",
+        "List the configured group rules",
+    ),
+    Command(
+        "grouprules",
+        "/grouprules [chat id]",
+        "Per-group keyword rules (run it inside a group to configure that one)",
     ),
 )
 
@@ -100,6 +105,7 @@ class BotCommands:
         watcher: Any = None,
         dispatcher: Any = None,
         watched: Any = None,
+        group_rules: Any = None,
         identity: dict[str, Any] | None = None,
     ) -> None:
         self._bot = bot_client
@@ -115,6 +121,7 @@ class BotCommands:
             watcher=watcher,
             dispatcher=dispatcher,
             watched=watched,
+            group_rules=group_rules,
             identity=self._identity,
         )
         self.panel = ControlPanel(
@@ -359,7 +366,25 @@ class BotCommands:
         await self._reply(event, f"✅ Keyword alerts enabled for {title}.")
 
     async def _cmd_keywordexclusions(self, event: Any, argument: str) -> None:
-        await self._reply(event, self.actions.exclusions_text())
+        await self._reply(event, self.actions.group_rules_text())
+
+    async def _cmd_grouprules(self, event: Any, argument: str) -> None:
+        """List configured groups, or open one by id."""
+        target = argument.strip()
+        if not target:
+            await self._reply(
+                event,
+                self.actions.group_rules_text()
+                + "\n\nOpen the panel with /start → 🏢 Group Rules, or send "
+                "/grouprules inside a group to configure that one.",
+            )
+            return
+        try:
+            await self.actions.ensure_group(target)
+        except ActionError as exc:
+            await self._reply(event, f"⚠️ {exc}")
+            return
+        await self.panel.send_group_panel(event, target)
 
     async def handle_group_exclusion_command(
         self, command: str, chat_id: int, title: str, sender_id: int | None
@@ -374,6 +399,17 @@ class BotCommands:
             logger.warning(
                 "Ignoring in-group /%s from unauthorised id %s", command, sender_id
             )
+            return
+
+        # /grouprules opens the configuration panel for this group, privately.
+        if command == "grouprules":
+            try:
+                await self.actions.ensure_group(chat_id, title)
+            except ActionError as exc:
+                logger.warning("Could not prepare group rules for %s: %s", chat_id, exc)
+                return
+            for recipient in sorted(set(self._admin_ids())):
+                await self.panel.send_group_panel_to(recipient, str(chat_id))
             return
 
         try:

@@ -1,0 +1,4 @@
+{
+  "_readme": "Per-group keyword rules. Keyed by Telegram chat id. 'ignored_keywords' are global keywords that should not fire in that group; 'extra_keywords' fire only there; 'keywords_enabled' false disables keyword matching for the group entirely (mentions and replies still work); 'description' is free text for humans and future AI use. Send /reload to the bot after editing by hand.",
+  "group_rules": {}
+}

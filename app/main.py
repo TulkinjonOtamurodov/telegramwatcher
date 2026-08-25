@@ -28,6 +28,7 @@ from app.clients import (
     start_bot_client,
 )
 from app.config import Config, ConfigError, load_config
+from app.group_rules import GroupRulesStore
 from app.keywords import KeywordStore
 from app.logging_config import get_logger, register_secret, setup_logging
 from app.settings import SettingsStore
@@ -35,6 +36,10 @@ from app.utils import display_name
 from app.watched_users import WatchedUserStore
 
 logger = get_logger("main")
+
+#: How many dialogs to scan, and how many groups to offer, in the picker.
+GROUP_PICKER_SCAN = 200
+GROUP_PICKER_LIMIT = 40
 
 STARTUP_MESSAGE = "\U0001f7e5 MAKIMA watcher is running.\n\nUse /help in private chat."
 
@@ -81,6 +86,7 @@ def _log_banner(
     keywords: KeywordStore,
     settings: SettingsStore,
     watched: WatchedUserStore,
+    group_rules: GroupRulesStore,
 ) -> None:
     username = getattr(me, "username", None)
     user_label = display_name(me)
@@ -93,6 +99,7 @@ def _log_banner(
     logger.info("Bot: @%s", getattr(bot_me, "username", "unknown"))
     logger.info("Keywords loaded: %d", keywords.count())
     logger.info("Watched members: %d", watched.count())
+    logger.info("Group rules loaded: %d", group_rules.count())
     logger.info("Modes: %s", settings.modes_summary())
     logger.info("=" * 58)
 
@@ -119,9 +126,16 @@ async def run() -> int:
         config.watched_users_file,
         defaults_path=config.defaults_dir / "watched_users.json",
     )
+    group_rules = GroupRulesStore(
+        config.group_rules_file,
+        defaults_path=config.defaults_dir / "group_rules.json",
+    )
     await settings.load()
     await keywords.load()
     await watched.load()
+    await group_rules.load()
+    # Folds any pre-group-rules keyword_excluded_chats config into the new model.
+    await group_rules.migrate_from_settings(settings)
 
     user_client = build_user_client(config)
     bot_client = build_bot_client(config)
@@ -156,6 +170,7 @@ async def run() -> int:
             keywords=keywords,
             dispatcher=dispatcher,
             watched=watched,
+            group_rules=group_rules,
         )
         watcher.bind_identity(me)
         await watcher.start()
@@ -172,6 +187,7 @@ async def run() -> int:
             watcher=watcher,
             dispatcher=dispatcher,
             watched=watched,
+            group_rules=group_rules,
             identity={
                 "user_display": user_display,
                 "bot_username": getattr(bot_me, "username", None),
@@ -185,11 +201,24 @@ async def run() -> int:
         commands.register()
         watcher.set_exclusion_handler(commands.handle_group_exclusion_command)
 
+        # The group picker lists chats the *user* client is actually in -- the
+        # bot never joins a group, so only the user client can know them.
+        async def _list_groups() -> list[tuple[str, str]]:
+            found: list[tuple[str, str]] = []
+            async for dialog in user_client.iter_dialogs(limit=GROUP_PICKER_SCAN):
+                if dialog.is_group or dialog.is_channel:
+                    found.append((str(dialog.id), dialog.name or str(dialog.id)))
+                if len(found) >= GROUP_PICKER_LIMIT:
+                    break
+            return found
+
+        commands.panel.set_group_source(_list_groups)
+
         monitor = ConnectionMonitor({"user": user_client, "bot": bot_client})
         await monitor.start()
 
         _install_signal_handlers(stop_event)
-        _log_banner(me, bot_me, keywords, settings, watched)
+        _log_banner(me, bot_me, keywords, settings, watched, group_rules)
 
         if not await dispatcher.send_now(STARTUP_MESSAGE):
             logger.warning(

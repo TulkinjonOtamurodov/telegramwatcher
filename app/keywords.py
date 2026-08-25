@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import re
 from pathlib import Path
+from typing import Iterable, Mapping
 
 from app.logging_config import get_logger
 from app.utils import atomic_write_text
@@ -76,6 +77,54 @@ def compile_keyword(keyword: str) -> re.Pattern[str]:
     prefix = r"(?<!\w)" if keyword[:1].isalnum() or keyword[:1] == "_" else ""
     suffix = r"(?!\w)" if keyword[-1:].isalnum() or keyword[-1:] == "_" else ""
     return re.compile(prefix + escaped + suffix, re.IGNORECASE | re.UNICODE)
+
+
+def find_hits_in(
+    text: str,
+    patterns: Mapping[str, "re.Pattern[str]"],
+    limit: int | None = None,
+) -> list[str]:
+    """Return the keywords in ``patterns`` that occur in ``text``.
+
+    Longest phrase first, and a keyword whose every match sits inside an
+    already-accepted longer match is dropped -- so ``"my fuel card declined"``
+    reports ``fuel card`` rather than ``fuel card, fuel, card``.
+
+    This is the one matching engine. Group-specific keywords are matched by
+    passing a different ``patterns`` mapping, never by a second implementation.
+    """
+    if not text or not patterns:
+        return []
+
+    accepted: list[str] = []
+    covered: list[tuple[int, int]] = []
+
+    for keyword in sorted(patterns, key=lambda item: (-len(item), item)):
+        spans = [match.span() for match in patterns[keyword].finditer(text)]
+        if not spans:
+            continue
+        if all(
+            any(start >= low and end <= high for low, high in covered)
+            for start, end in spans
+        ):
+            continue
+        accepted.append(keyword)
+        covered.extend(spans)
+        if limit is not None and len(accepted) >= limit:
+            break
+
+    return accepted
+
+
+def compile_all(keywords: Iterable[str]) -> dict[str, "re.Pattern[str]"]:
+    """Compile a list of already-normalised keywords into a pattern map."""
+    patterns: dict[str, re.Pattern[str]] = {}
+    for keyword in keywords:
+        try:
+            patterns[keyword] = compile_keyword(keyword)
+        except re.error as exc:  # pragma: no cover - re.escape makes this unlikely
+            logger.error("Could not compile keyword %r (%s); skipping it", keyword, exc)
+    return patterns
 
 
 class KeywordStore:
@@ -189,34 +238,25 @@ class KeywordStore:
         return keyword
 
     # -- matching ---------------------------------------------------------- #
+    @property
+    def patterns(self) -> dict[str, "re.Pattern[str]"]:
+        """A copy of the compiled global patterns."""
+        return dict(self._patterns)
+
+    def patterns_excluding(self, ignored: Iterable[str]) -> dict[str, "re.Pattern[str]"]:
+        """Global patterns minus the keywords a group has chosen to ignore."""
+        skip = {str(word).strip().lower() for word in ignored if str(word).strip()}
+        if not skip:
+            return dict(self._patterns)
+        return {
+            keyword: pattern
+            for keyword, pattern in self._patterns.items()
+            if keyword not in skip
+        }
+
     def find_hits(self, text: str, limit: int | None = None) -> list[str]:
-        """Return the keywords found in ``text``, longest phrase first.
-
-        A keyword whose every match sits inside an already-accepted longer
-        match is dropped, so ``"my fuel card declined"`` reports ``fuel card``
-        rather than ``fuel card, fuel, card``.
-        """
-        if not text or not self._patterns:
-            return []
-
-        accepted: list[str] = []
-        covered: list[tuple[int, int]] = []
-
-        for keyword in sorted(self._patterns, key=lambda item: (-len(item), item)):
-            spans = [match.span() for match in self._patterns[keyword].finditer(text)]
-            if not spans:
-                continue
-            if all(
-                any(start >= low and end <= high for low, high in covered)
-                for start, end in spans
-            ):
-                continue
-            accepted.append(keyword)
-            covered.extend(spans)
-            if limit is not None and len(accepted) >= limit:
-                break
-
-        return accepted
+        """Match ``text`` against every global keyword."""
+        return find_hits_in(text, self._patterns, limit)
 
     def matches(self, text: str) -> bool:
         return any(pattern.search(text) for pattern in self._patterns.values())
