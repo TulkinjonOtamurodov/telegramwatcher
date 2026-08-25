@@ -14,7 +14,7 @@ compose() {
     docker-compose "$@"
   else
     echo "Error: neither 'docker compose' nor 'docker-compose' is available." >&2
-    echo "Install it with: apt install -y docker.io docker-compose-plugin" >&2
+    echo "Install it with: curl -fsSL https://get.docker.com | sh" >&2
     exit 1
   fi
 }

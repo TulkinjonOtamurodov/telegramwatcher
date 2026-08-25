@@ -402,12 +402,27 @@ Alerts are sent as plain text with no parse mode, so message content containing
 Tested against a plain Ubuntu 22.04 / 24.04 VPS. Run as root, or prefix with
 `sudo`.
 
+> A step-by-step Hostinger runbook, including SSH, snapshots, private-repo
+> access and day-2 operations, is in [docs/HOSTINGER.md](docs/HOSTINGER.md).
+
 ### 1. Install Docker and git
+
+Ubuntu's own repositories do **not** carry `docker-compose-plugin` on 22.04, so
+use Docker's official install script — it works on 22.04 and 24.04 alike and
+installs the `docker compose` plugin:
 
 ```bash
 apt update
-apt install -y git docker.io docker-compose-plugin
+apt install -y git curl
+curl -fsSL https://get.docker.com | sh
 systemctl enable --now docker
+```
+
+Verify both are present before continuing:
+
+```bash
+docker --version
+docker compose version
 ```
 
 ### 2. Clone the repository
@@ -748,6 +763,9 @@ telegram-watcher/
 │   │   └── watcher_settings.json
 │   ├── keywords.txt          # live, git-ignored, bot-editable
 │   └── watcher_settings.json # live, git-ignored, bot-editable
+│
+├── docs/
+│   └── HOSTINGER.md          # step-by-step VPS runbook
 │
 ├── sessions/                 # Telethon sessions (git-ignored)
 ├── logs/                     # makima.log (git-ignored)
