@@ -257,10 +257,36 @@ All commands work only in a **private chat** with your bot, and only for the
 user IDs in `ADMIN_USER_IDS` (or, if that is empty, the account the watcher
 signed in as).
 
+### The control panel
+
+`/start` and `/help` open an inline button panel — the easiest way to drive
+MAKIMA day to day:
+
+```
+⚙️ MAKIMA CONTROL PANEL
+Watcher controls and alert settings.
+
+[ 📊 Status        ] [ 🔑 Keywords      ]
+[ 👤 Mentions: ON  ] [ ↩️ Replies: ON   ]
+[ 🎯 Keywords: ON  ] [ 📝 Template      ]
+[ 📏 Preview: 500  ] [ 🔄 Reload        ]
+```
+
+The three mode buttons show live state and toggle on tap. **Keywords** opens an
+add/remove menu, **Template** lets you replace or reset the alert format, and
+**Preview** offers 200/500/1000/2000 or a custom value.
+
+Buttons that need typed input (add or remove a keyword, a new template, a custom
+preview length) prompt you and consume your next message, with a **❌ Cancel**
+button throughout. Sending any slash command also cancels a prompt.
+
+Every button calls the same code as its command equivalent, so changes made from
+the panel persist identically. The commands below all still work.
+
 | Command | What it does |
 | --- | --- |
-| `/start` | Confirms the bot is alive and alerts can reach you |
-| `/help` | Lists every command |
+| `/start` | Opens the control panel |
+| `/help` | Opens the control panel and lists the commands |
 | `/status` | Modes, keyword count, uptime and counters |
 | `/keywords` | Lists active keywords (first 120, then a count of the rest) |
 | `/addkeyword <word>` | Adds a keyword or phrase, saved to disk immediately |
@@ -747,7 +773,9 @@ telegram-watcher/
 │   ├── config.py             # .env loading, paths, validation
 │   ├── clients.py            # the two Telethon clients + reconnect monitor
 │   ├── watcher.py            # mention / reply / keyword detection
-│   ├── bot_commands.py       # the private control panel
+│   ├── actions.py            # shared logic behind commands and buttons
+│   ├── bot_commands.py       # slash-command dispatch
+│   ├── control_panel.py      # inline keyboard + typed-input flows
 │   ├── alerts.py             # alert formatting + delivery queue
 │   ├── keywords.py           # keyword storage and matching
 │   ├── settings.py           # settings with deep-merge and atomic writes
@@ -950,3 +978,6 @@ automatically; matching is case-insensitive.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+# telegramwatcher
+# telegramwatcher
+# telegramwatcher

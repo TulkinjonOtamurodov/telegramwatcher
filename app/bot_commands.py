@@ -3,61 +3,48 @@
 Every command is handled by a single dispatcher so that authorisation, error
 handling and long-reply chunking live in exactly one place. Nothing here needs a
 restart -- keyword and settings changes are written to disk immediately.
+
+The actual work lives in :class:`~app.actions.MakimaActions`, which the inline
+button panel in :mod:`app.control_panel` also uses. A command and its equivalent
+button therefore run the same code path.
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
-import time
 from typing import Any, Callable, Iterable, NamedTuple
 
 from telethon import events
 from telethon.errors import FloodWaitError, RPCError
 
-from app.ai_classifier import CATEGORIES, has_backend
-from app.keywords import KeywordError, KeywordStore
-from app.logging_config import get_logger
-from app.settings import (
-    DEFAULT_TEMPLATE,
-    MAX_MESSAGE_CHARS,
-    MIN_MESSAGE_CHARS,
-    SettingsStore,
+from app.actions import (
+    KEYWORD_LIST_LIMIT,
+    KNOWN_PLACEHOLDERS,
+    MAX_TEMPLATE_LENGTH,
+    ActionError,
+    MakimaActions,
+    on_off,
 )
-from app.utils import chunk_text, template_placeholders
+from app.ai_classifier import CATEGORIES
+from app.control_panel import ControlPanel
+from app.keywords import KeywordStore
+from app.logging_config import get_logger
+from app.settings import MAX_MESSAGE_CHARS, MIN_MESSAGE_CHARS, SettingsStore
+from app.utils import chunk_text
 
 logger = get_logger("commands")
-
-#: How many keywords /keywords prints before summarising the rest.
-KEYWORD_LIST_LIMIT = 120
-
-#: Longest template accepted by /settemplate.
-MAX_TEMPLATE_LENGTH = 2000
 
 _COMMAND_RE = re.compile(r"^/([A-Za-z0-9_]+)(?:@[\w_]+)?(?:[ \t]+([\s\S]+))?$")
 
 _ON_OFF = {"on": True, "off": False, "true": True, "false": False, "1": True, "0": False}
 
-KNOWN_PLACEHOLDERS = {
-    "timestamp",
-    "reasons",
-    "group",
-    "group_link",
-    "sender",
-    "sender_name",
-    "sender_username",
-    "sender_id",
-    "chat_id",
-    "message_id",
-    "keyword_hits",
-    "message_text",
-    "message_link",
-    "category",
-    "severity",
-    "summary",
-    "requires_action",
-    "unit",
-}
+#: Shown under the button panel by /help.
+HELP_NOTE = (
+    "Slash commands still work as well: /status /keywords /addkeyword "
+    "/removekeyword /setmentions /setreplies /setkeywords /setmaxchars "
+    "/template /settemplate /reload"
+)
 
 
 class Command(NamedTuple):
@@ -67,8 +54,8 @@ class Command(NamedTuple):
 
 
 COMMANDS: tuple[Command, ...] = (
-    Command("start", "/start", "Wake the bot and confirm alerts can reach you"),
-    Command("help", "/help", "Show this list"),
+    Command("start", "/start", "Open the control panel"),
+    Command("help", "/help", "Open the control panel and list the commands"),
     Command("status", "/status", "Current modes, keyword count and counters"),
     Command("keywords", "/keywords", "List the active keywords"),
     Command("addkeyword", "/addkeyword <word>", "Add a keyword or phrase"),
@@ -83,12 +70,8 @@ COMMANDS: tuple[Command, ...] = (
 )
 
 
-def _on_off(value: bool) -> str:
-    return "ON" if value else "OFF"
-
-
 class BotCommands:
-    """Wires the command handler onto the bot client."""
+    """Wires the command handler and the button panel onto the bot client."""
 
     def __init__(
         self,
@@ -105,11 +88,21 @@ class BotCommands:
         self._settings = settings
         self._keywords = keywords
         self._admin_ids = admin_ids
-        self._watcher = watcher
-        self._dispatcher = dispatcher
         self._identity = identity or {}
-        self._started_at = time.monotonic()
         self._registered = False
+
+        self.actions = MakimaActions(
+            settings=settings,
+            keywords=keywords,
+            watcher=watcher,
+            dispatcher=dispatcher,
+            identity=self._identity,
+        )
+        self.panel = ControlPanel(
+            bot_client,
+            actions=self.actions,
+            is_authorized=self.is_authorized,
+        )
 
     # -- lifecycle --------------------------------------------------------- #
     def register(self) -> None:
@@ -119,11 +112,13 @@ class BotCommands:
             self._on_command,
             events.NewMessage(incoming=True, pattern=_COMMAND_RE, func=lambda e: e.is_private),
         )
+        self.panel.register()
         self._registered = True
         logger.info("Bot command handler registered (%d commands)", len(COMMANDS))
 
     def set_identity(self, **values: Any) -> None:
         self._identity.update(values)
+        self.actions.identity.update(values)
 
     def is_authorized(self, user_id: int | None) -> bool:
         if user_id is None:
@@ -154,7 +149,7 @@ class BotCommands:
             if handler is None:
                 await self._reply(
                     event,
-                    f"Unknown command /{command}. Send /help for the list.",
+                    f"Unknown command /{command}. Send /help for the control panel.",
                 )
                 return
 
@@ -185,92 +180,30 @@ class BotCommands:
 
     # -- commands ---------------------------------------------------------- #
     async def _cmd_start(self, event: Any, argument: str) -> None:
-        name = self._identity.get("user_display", "your account")
-        await self._reply(
-            event,
-            "\U0001f7e5 MAKIMA is online.\n\n"
-            f"Watching Telegram as: {name}\n"
-            f"Keywords loaded: {self._keywords.count()}\n"
-            f"Modes: {self._settings.modes_summary()}\n\n"
-            "Send /help to see everything you can change from here.",
-        )
+        await self.panel.send_panel(event)
 
     async def _cmd_help(self, event: Any, argument: str) -> None:
-        lines = ["\U0001f4d6 MAKIMA COMMANDS", ""]
-        width = max(len(cmd.usage) for cmd in COMMANDS)
-        for cmd in COMMANDS:
-            lines.append(f"{cmd.usage.ljust(width)}  -  {cmd.description}")
-        lines += [
-            "",
-            "Keywords are case-insensitive and match on word boundaries, so",
-            "'claim' does not fire on 'disclaimer'. Multi-word phrases such as",
-            "'fuel card' are supported.",
-        ]
-        await self._reply(event, "\n".join(lines))
+        await self.panel.send_panel(event, note=HELP_NOTE)
 
     async def _cmd_status(self, event: Any, argument: str) -> None:
-        settings = self._settings
-        uptime = int(time.monotonic() - self._started_at)
-        hours, remainder = divmod(uptime, 3600)
-        minutes, seconds = divmod(remainder, 60)
-
-        lines = [
-            "⚙️ MAKIMA STATUS",
-            "",
-            f"Mentions: {_on_off(settings.watch_mentions)}",
-            f"Replies: {_on_off(settings.watch_replies)}",
-            f"Keywords: {_on_off(settings.watch_keywords)}",
-            f"Keywords loaded: {self._keywords.count()}",
-            f"Max preview chars: {settings.max_message_chars}",
-            f"AI classification: {_on_off(settings.ai_enabled)}"
-            + ("" if not settings.ai_enabled else f" ({'backend' if has_backend() else 'rule-based'})"),
-            "",
-            f"Uptime: {hours}h {minutes}m {seconds}s",
-        ]
-
-        if self._watcher is not None:
-            lines.append(f"Messages inspected: {self._watcher.messages_seen}")
-            lines.append(f"Alerts raised: {self._watcher.alerts_raised}")
-        if self._dispatcher is not None:
-            stats = self._dispatcher.stats
-            lines.append(
-                f"Alerts delivered: {stats['sent']} (failed {stats['failed']}, "
-                f"queued {stats['queued']})"
-            )
-
-        user_display = self._identity.get("user_display")
-        bot_username = self._identity.get("bot_username")
-        if user_display:
-            lines.append(f"Account: {user_display}")
-        if bot_username:
-            lines.append(f"Bot: @{bot_username}")
-
-        await self._reply(event, "\n".join(lines))
+        await self._reply(event, self.actions.status_text())
 
     async def _cmd_keywords(self, event: Any, argument: str) -> None:
-        items = self._keywords.all()
-        if not items:
+        if self._keywords.count() == 0:
             await self._reply(
                 event,
                 "No keywords are configured. Add one with /addkeyword <word>.",
             )
             return
-
-        shown = items[:KEYWORD_LIST_LIMIT]
-        header = f"\U0001f9f7 KEYWORDS ({len(items)})"
-        body = "\n".join(f"- {item}" for item in shown)
-        footer = ""
-        if len(items) > KEYWORD_LIST_LIMIT:
-            footer = f"\n\n... and {len(items) - KEYWORD_LIST_LIMIT} more."
-        await self._reply(event, f"{header}\n\n{body}{footer}")
+        await self._reply(event, self.actions.keywords_text(limit=KEYWORD_LIST_LIMIT))
 
     async def _cmd_addkeyword(self, event: Any, argument: str) -> None:
         if not argument:
             await self._reply(event, "Usage: /addkeyword <word or phrase>")
             return
         try:
-            keyword = await self._keywords.add(argument)
-        except KeywordError as exc:
+            keyword = await self.actions.add_keyword(argument)
+        except ActionError as exc:
             await self._reply(event, f"⚠️ {exc}")
             return
         await self._reply(
@@ -283,8 +216,8 @@ class BotCommands:
             await self._reply(event, "Usage: /removekeyword <word or phrase>")
             return
         try:
-            keyword = await self._keywords.remove(argument)
-        except KeywordError as exc:
+            keyword = await self.actions.remove_keyword(argument)
+        except ActionError as exc:
             await self._reply(event, f"⚠️ {exc}")
             return
         await self._reply(
@@ -292,54 +225,47 @@ class BotCommands:
             f"✅ Removed '{keyword}'. Now watching {self._keywords.count()} keywords.",
         )
 
-    async def _toggle(self, event: Any, argument: str, path: str, label: str) -> None:
+    async def _toggle(self, event: Any, argument: str, mode: str, label: str) -> None:
         choice = _ON_OFF.get(argument.strip().lower())
         if choice is None:
-            current = _on_off(self._settings.get_bool(path, True))
+            current = on_off(self.actions.watch_enabled(mode))
             await self._reply(
                 event,
                 f"Usage: /set{label.lower()} on|off  (currently {current})",
             )
             return
-        await self._settings.set(path, choice)
-        await self._reply(event, f"✅ {label} alerts are now {_on_off(choice)}.")
+        await self.actions.set_watch(mode, choice)
+        await self._reply(event, f"✅ {label} alerts are now {on_off(choice)}.")
 
     async def _cmd_setmentions(self, event: Any, argument: str) -> None:
-        await self._toggle(event, argument, "watching.mentions", "Mentions")
+        await self._toggle(event, argument, "mentions", "Mentions")
 
     async def _cmd_setreplies(self, event: Any, argument: str) -> None:
-        await self._toggle(event, argument, "watching.replies", "Replies")
+        await self._toggle(event, argument, "replies", "Replies")
 
     async def _cmd_setkeywords(self, event: Any, argument: str) -> None:
-        await self._toggle(event, argument, "watching.keywords", "Keywords")
+        await self._toggle(event, argument, "keywords", "Keywords")
 
     async def _cmd_setmaxchars(self, event: Any, argument: str) -> None:
-        raw = argument.strip()
-        if not raw.lstrip("-").isdigit():
+        if not argument.strip():
             await self._reply(
                 event,
                 f"Usage: /setmaxchars <{MIN_MESSAGE_CHARS}-{MAX_MESSAGE_CHARS}>  "
-                f"(currently {self._settings.max_message_chars})",
+                f"(currently {self.actions.max_chars})",
             )
             return
-        value = int(raw)
-        if not MIN_MESSAGE_CHARS <= value <= MAX_MESSAGE_CHARS:
-            await self._reply(
-                event,
-                f"⚠️ Value must be between {MIN_MESSAGE_CHARS} and {MAX_MESSAGE_CHARS}.",
-            )
+        try:
+            value = await self.actions.set_max_chars(argument)
+        except ActionError as exc:
+            await self._reply(event, f"⚠️ {exc}")
             return
-        await self._settings.set("alerts.max_message_chars", value)
         await self._reply(event, f"✅ Alert previews are now capped at {value} characters.")
 
     async def _cmd_template(self, event: Any, argument: str) -> None:
-        template = self._settings.template
         await self._reply(
             event,
-            "\U0001f4dd CURRENT ALERT TEMPLATE\n"
-            "(copy, edit, and send it back after /settemplate)\n\n"
-            f"{template}\n\n"
-            "Placeholders: " + ", ".join(f"{{{{{name}}}}}" for name in sorted(KNOWN_PLACEHOLDERS)),
+            self.actions.template_text(with_placeholders=True)
+            + "\n\n(copy, edit, and send it back after /settemplate)",
         )
 
     async def _cmd_settemplate(self, event: Any, argument: str) -> None:
@@ -349,26 +275,20 @@ class BotCommands:
                 "Usage: /settemplate <text>\n\n"
                 "The text may span multiple lines. A literal \\n is also accepted "
                 "and converted to a line break. Send /settemplate default to restore "
-                "the shipped template.",
+                f"the shipped template. Limit: {MAX_TEMPLATE_LENGTH} characters.",
             )
             return
 
         if argument.strip().lower() == "default":
-            await self._settings.set("alerts.template", DEFAULT_TEMPLATE)
+            await self.actions.reset_template()
             await self._reply(event, "✅ Template restored to the default.")
             return
 
-        template = argument.replace("\\n", "\n")
-        if len(template) > MAX_TEMPLATE_LENGTH:
-            await self._reply(
-                event,
-                f"⚠️ Template is too long ({len(template)} chars, "
-                f"limit {MAX_TEMPLATE_LENGTH}).",
-            )
+        try:
+            unknown = await self.actions.set_template(argument)
+        except ActionError as exc:
+            await self._reply(event, f"⚠️ {exc}")
             return
-
-        unknown = sorted(template_placeholders(template) - KNOWN_PLACEHOLDERS)
-        await self._settings.set("alerts.template", template)
 
         note = ""
         if unknown:
@@ -379,16 +299,13 @@ class BotCommands:
         await self._reply(event, f"✅ Template updated.{note}")
 
     async def _cmd_reload(self, event: Any, argument: str) -> None:
-        await self._settings.load()
-        await self._keywords.load()
-        await self._reply(
-            event,
-            "\U0001f504 Reloaded from disk.\n"
-            f"Keywords loaded: {self._keywords.count()}\n"
-            f"Modes: {self._settings.modes_summary()}",
-        )
+        await self.actions.reload()
+        await self._reply(event, self.actions.reload_text())
 
     # Categories are exposed so a future AI command can list them.
     @staticmethod
     def categories() -> tuple[str, ...]:
         return CATEGORIES
+
+
+__all__ = ["BotCommands", "COMMANDS", "Command", "KNOWN_PLACEHOLDERS"]
