@@ -21,6 +21,7 @@ logs/*
 # so a `git pull` during deploy can never conflict with local changes.
 data/keywords.txt
 data/watcher_settings.json
+data/watched_users.json
 data/*.corrupt
 data/.*.tmp
 

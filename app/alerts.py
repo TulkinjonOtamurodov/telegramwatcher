@@ -1,16 +1,25 @@
 """Alert formatting and delivery.
 
-:func:`build_alert` turns a Telegram event plus the reasons it matched into the
-final text. :class:`AlertDispatcher` owns a small queue and a worker task, so a
-flood wait while sending can never block the message watcher.
+:func:`build_alert` turns a matched message into the text an admin sees plus the
+deep link that becomes the "OPEN MESSAGE" button. :class:`AlertDispatcher` owns
+a small queue and a worker task, so a flood wait while sending can never block
+the message watcher.
+
+Alerts are sent with ``parse_mode=None``. Nothing in a group message is ever
+parsed as Markdown or HTML, so a sender name, group title or message body cannot
+break the rendering or inject formatting -- the strongest form of escaping is
+not parsing at all. The button is separate from the text for the same reason.
 """
 
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
+from telethon import Button
 from telethon.errors import (
+    ButtonUrlInvalidError,
     ChatWriteForbiddenError,
     FloodWaitError,
     InputUserDeactivatedError,
@@ -26,7 +35,9 @@ from app.utils import (
     build_group_link,
     build_message_link,
     display_name,
+    message_url,
     render_template,
+    split_heading,
     truncate,
     utc_timestamp,
 )
@@ -37,6 +48,23 @@ REASON_MENTION = "mention"
 REASON_REPLY = "reply"
 REASON_KEYWORD_PREFIX = "keyword:"
 
+#: Tag used when no watched member was mentioned.
+DEFAULT_TAG = "SAFETY"
+
+#: Label on the inline deep-link button.
+OPEN_MESSAGE_LABEL = "\U0001f517 OPEN MESSAGE"
+
+#: Separates the trigger words on the second line of an alert.
+TRIGGER_SEPARATOR = " • "
+
+#: Marks a detected heading line in the message block.
+HEADING_PREFIX = "\U0001f4c4 "
+
+_MENTION_TRIGGER = "MENTION"
+_REPLY_TRIGGER = "REPLY"
+
+# Legacy display labels, still used by the {{reasons}} placeholder so an older
+# custom template keeps rendering the way its author expects.
 _MENTION_LABEL = "\U0001f7e5 Mention"
 _REPLY_LABEL = "\U0001f9f7 Reply"
 _KEYWORD_LABEL = "\U0001f50d Keyword"
@@ -52,17 +80,24 @@ MAX_SEND_ATTEMPTS = 3
 MAX_FLOOD_WAIT_SECONDS = 900
 
 
+@dataclass(frozen=True)
+class Alert:
+    """One rendered alert: the text, and optionally a link to button up."""
+
+    text: str
+    url: str | None = None
+
+
 def keyword_reason(keyword: str) -> str:
     """Build the raw reason code the watcher emits for a keyword hit."""
     return f"{REASON_KEYWORD_PREFIX}{keyword}"
 
 
 def format_reason(raw: str) -> str:
-    """Turn a raw reason code into its display form.
+    """Turn a raw reason code into its legacy display form.
 
-    ``"mention"`` -> ``"\U0001f7e5 Mention"``,
-    ``"keyword:fuel"`` -> ``"\U0001f50d Keyword: fuel"``.
-    The legacy ``"Keyword match: fuel"`` phrasing is understood too.
+    Retained for the ``{{reasons}}`` placeholder, which older custom templates
+    may still use. The current default uses ``{{triggers}}`` instead.
     """
     text = (raw or "").strip()
     lowered = text.lower()
@@ -80,6 +115,33 @@ def format_reason(raw: str) -> str:
 def format_reasons(reasons: Iterable[str]) -> str:
     formatted = [format_reason(reason) for reason in reasons]
     return " | ".join(part for part in formatted if part) or "-"
+
+
+def format_tags(tags: Sequence[str] | None) -> str:
+    """``#RAYN #THOMAS``, or ``#SAFETY`` when no watched member was mentioned."""
+    cleaned = [str(tag).strip().lstrip("#").upper() for tag in (tags or [])]
+    cleaned = [tag for tag in cleaned if tag]
+    if not cleaned:
+        return f"#{DEFAULT_TAG}"
+    seen: list[str] = []
+    for tag in cleaned:
+        if tag not in seen:
+            seen.append(tag)
+    return " ".join(f"#{tag}" for tag in seen)
+
+
+def format_triggers(reasons: Sequence[str], keyword_hits: Sequence[str], limit: int) -> str:
+    """``MENTION • INSURANCE``: what fired, uppercase, in a fixed order."""
+    parts: list[str] = []
+    if REASON_MENTION in reasons:
+        parts.append(_MENTION_TRIGGER)
+    if REASON_REPLY in reasons:
+        parts.append(_REPLY_TRIGGER)
+    for keyword in list(keyword_hits)[: max(1, limit)]:
+        upper = str(keyword).strip().upper()
+        if upper and upper not in parts:
+            parts.append(upper)
+    return TRIGGER_SEPARATOR.join(parts) if parts else "ALERT"
 
 
 def _describe_media(message: Any) -> str:
@@ -111,28 +173,36 @@ def build_alert(
     chat: Any = None,
     settings: SettingsStore,
     classification: dict[str, Any] | None = None,
-) -> str:
-    """Render the alert text for one matched message."""
+    tags: Sequence[str] | None = None,
+) -> Alert:
+    """Render one matched message into the alert an admin receives."""
     message = getattr(event, "message", None)
     chat = chat if chat is not None else getattr(event, "chat", None)
     message_id = getattr(message, "id", 0) or 0
 
     group_name = display_name(chat, fallback="Unknown group")
-    group_link = build_group_link(chat)
-    message_link = build_message_link(chat, message_id)
+    url = message_url(chat, message_id)
 
     sender_display = sender_name or "Unknown"
     if sender_username:
         sender_display = f"{sender_display} (@{sender_username})"
 
-    raw_text = (getattr(message, "raw_text", None) or getattr(event, "raw_text", "") or "").strip()
+    raw_text = (
+        getattr(message, "raw_text", None) or getattr(event, "raw_text", "") or ""
+    ).strip()
+
+    heading: str | None = None
     if not settings.include_message_text:
         body = "(message text hidden by settings)"
     elif raw_text:
-        body = truncate(raw_text, settings.max_message_chars)
+        heading, body = split_heading(raw_text)
+        body = truncate(body, settings.max_message_chars)
     else:
         media = _describe_media(message)
         body = f"(no text - {media})" if media else "(no text)"
+
+    heading_line = f"{HEADING_PREFIX}{heading}" if heading else ""
+    message_block = f"{heading_line}\n{body}" if heading_line else body
 
     preview_limit = settings.max_keyword_preview
     shown_hits = list(keyword_hits)[:preview_limit]
@@ -143,11 +213,20 @@ def build_alert(
 
     classification = classification or {}
     variables: dict[str, Any] = {
-        "timestamp": utc_timestamp(settings.timestamp_format, getattr(message, "date", None)),
-        "reasons": format_reasons(reasons),
-        "group": group_name,
-        "group_link": group_link,
+        # -- the current format --
+        "tags": format_tags(tags),
+        "triggers": format_triggers(reasons, keyword_hits, preview_limit),
         "sender": sender_display,
+        "group": group_name,
+        "heading": heading_line,
+        "body": body,
+        "message_block": message_block,
+        # -- kept working for older custom templates --
+        "timestamp": utc_timestamp(
+            settings.timestamp_format, getattr(message, "date", None)
+        ),
+        "reasons": format_reasons(reasons),
+        "group_link": build_group_link(chat),
         "sender_name": sender_name,
         "sender_username": f"@{sender_username}" if sender_username else "-",
         "sender_id": getattr(event, "sender_id", None) or "-",
@@ -155,8 +234,8 @@ def build_alert(
         "message_id": message_id,
         "keyword_hits": hits_text,
         "message_text": body,
-        "message_link": message_link,
-        # Populated once the AI layer is switched on; harmless placeholders now.
+        "message_link": build_message_link(chat, message_id),
+        # -- populated only once the AI layer is switched on --
         "category": classification.get("category", "-"),
         "severity": classification.get("severity", "-"),
         "summary": classification.get("summary", "") or "-",
@@ -165,7 +244,7 @@ def build_alert(
     }
 
     rendered = render_template(settings.template, variables)
-    return truncate(rendered, TELEGRAM_MAX_MESSAGE, suffix="\n[...]")
+    return Alert(text=truncate(rendered, TELEGRAM_MAX_MESSAGE, suffix="\n[...]"), url=url)
 
 
 class AlertDispatcher:
@@ -174,7 +253,7 @@ class AlertDispatcher:
     def __init__(self, bot_client: Any, recipients: Sequence[int] | None = None) -> None:
         self._bot = bot_client
         self._recipients: list[int] = list(recipients or [])
-        self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
+        self._queue: asyncio.Queue[Alert] = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
         self._worker: asyncio.Task[None] | None = None
         self._sent = 0
         self._failed = 0
@@ -214,10 +293,11 @@ class AlertDispatcher:
         logger.info("Alert dispatcher stopped")
 
     # -- queueing ---------------------------------------------------------- #
-    async def enqueue(self, text: str) -> None:
+    async def enqueue(self, alert: Alert | str) -> None:
         """Hand an alert to the worker without ever blocking the caller."""
+        item = alert if isinstance(alert, Alert) else Alert(text=str(alert))
         try:
-            self._queue.put_nowait(text)
+            self._queue.put_nowait(item)
         except asyncio.QueueFull:
             try:
                 dropped = self._queue.get_nowait()
@@ -225,26 +305,27 @@ class AlertDispatcher:
                 logger.warning(
                     "Alert queue full (%d); dropped the oldest alert (%d chars)",
                     QUEUE_MAX_SIZE,
-                    len(dropped),
+                    len(dropped.text),
                 )
             except asyncio.QueueEmpty:  # pragma: no cover - race, harmless
                 pass
             try:
-                self._queue.put_nowait(text)
+                self._queue.put_nowait(item)
             except asyncio.QueueFull:  # pragma: no cover - race, harmless
                 self._failed += 1
                 logger.error("Alert dropped: queue still full")
 
-    async def send_now(self, text: str) -> bool:
+    async def send_now(self, alert: Alert | str) -> bool:
         """Send immediately, bypassing the queue (used for the startup notice)."""
-        return await self._deliver(text)
+        item = alert if isinstance(alert, Alert) else Alert(text=str(alert))
+        return await self._deliver(item)
 
     # -- worker ------------------------------------------------------------ #
     async def _run(self) -> None:
         while True:
-            text = await self._queue.get()
+            alert = await self._queue.get()
             try:
-                await self._deliver(text)
+                await self._deliver(alert)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -252,7 +333,7 @@ class AlertDispatcher:
             finally:
                 self._queue.task_done()
 
-    async def _deliver(self, text: str) -> bool:
+    async def _deliver(self, alert: Alert) -> bool:
         if not self._recipients:
             logger.error("No alert recipients configured; alert not delivered")
             self._failed += 1
@@ -260,7 +341,7 @@ class AlertDispatcher:
 
         delivered_any = False
         for recipient in self._recipients:
-            if await self._send_to(recipient, text):
+            if await self._send_to(recipient, alert):
                 delivered_any = True
 
         if delivered_any:
@@ -269,16 +350,36 @@ class AlertDispatcher:
             self._failed += 1
         return delivered_any
 
-    async def _send_to(self, recipient: int, text: str) -> bool:
+    @staticmethod
+    def _buttons(url: str | None) -> list[list[Any]] | None:
+        """The deep-link button, or nothing at all when there is no link."""
+        if not url:
+            return None
+        return [[Button.url(OPEN_MESSAGE_LABEL, url)]]
+
+    async def _send_to(self, recipient: int, alert: Alert) -> bool:
+        buttons = self._buttons(alert.url)
+
         for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
             try:
                 await self._bot.send_message(
                     recipient,
-                    text,
+                    alert.text,
+                    buttons=buttons,
                     link_preview=False,
-                    parse_mode=None,  # user content is sent verbatim, never parsed
+                    parse_mode=None,  # group content is sent verbatim, never parsed
                 )
                 return True
+
+            except ButtonUrlInvalidError:
+                # A link Telegram will not accept must never cost us the alert.
+                logger.warning(
+                    "Telegram rejected the message link %r; sending without the button",
+                    alert.url,
+                )
+                if buttons is None:
+                    return False
+                buttons = None
 
             except FloodWaitError as exc:
                 wait_for = int(getattr(exc, "seconds", 0)) + 2

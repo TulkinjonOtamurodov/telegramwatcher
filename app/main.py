@@ -31,6 +31,7 @@ from app.keywords import KeywordStore
 from app.logging_config import get_logger, register_secret, setup_logging
 from app.settings import SettingsStore
 from app.utils import display_name
+from app.watched_users import WatchedUserStore
 
 logger = get_logger("main")
 
@@ -73,7 +74,13 @@ def _resolve_admins(config: Config, me: Any) -> list[int]:
     return [my_id]
 
 
-def _log_banner(me: Any, bot_me: Any, keywords: KeywordStore, settings: SettingsStore) -> None:
+def _log_banner(
+    me: Any,
+    bot_me: Any,
+    keywords: KeywordStore,
+    settings: SettingsStore,
+    watched: WatchedUserStore,
+) -> None:
     username = getattr(me, "username", None)
     user_label = display_name(me)
     if username:
@@ -84,6 +91,7 @@ def _log_banner(me: Any, bot_me: Any, keywords: KeywordStore, settings: Settings
     logger.info("User: %s", user_label)
     logger.info("Bot: @%s", getattr(bot_me, "username", "unknown"))
     logger.info("Keywords loaded: %d", keywords.count())
+    logger.info("Watched members: %d", watched.count())
     logger.info("Modes: %s", settings.modes_summary())
     logger.info("=" * 58)
 
@@ -106,8 +114,13 @@ async def run() -> int:
     keywords = KeywordStore(
         config.keywords_file, defaults_path=config.defaults_dir / "keywords.txt"
     )
+    watched = WatchedUserStore(
+        config.watched_users_file,
+        defaults_path=config.defaults_dir / "watched_users.json",
+    )
     await settings.load()
     await keywords.load()
+    await watched.load()
 
     user_client = build_user_client(config)
     bot_client = build_bot_client(config)
@@ -140,6 +153,7 @@ async def run() -> int:
             settings=settings,
             keywords=keywords,
             dispatcher=dispatcher,
+            watched=watched,
         )
         watcher.bind_identity(me)
         await watcher.start()
@@ -155,6 +169,7 @@ async def run() -> int:
             admin_ids=lambda: admins,
             watcher=watcher,
             dispatcher=dispatcher,
+            watched=watched,
             identity={
                 "user_display": user_display,
                 "bot_username": getattr(bot_me, "username", None),
@@ -166,7 +181,7 @@ async def run() -> int:
         await monitor.start()
 
         _install_signal_handlers(stop_event)
-        _log_banner(me, bot_me, keywords, settings)
+        _log_banner(me, bot_me, keywords, settings, watched)
 
         if not await dispatcher.send_now(STARTUP_MESSAGE):
             logger.warning(

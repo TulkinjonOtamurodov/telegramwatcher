@@ -39,7 +39,8 @@ Private MAKIMA Alerts
 - [First authentication](#first-authentication)
 - [Bot commands](#bot-commands)
 - [Configuration files](#configuration-files)
-- [Alert template](#alert-template)
+- [Alert format](#alert-format)
+- [Watched members](#watched-members)
 - [Hostinger VPS deployment](#hostinger-vps-deployment)
 - [Updating](#updating)
 - [Migrating from the old watcher](#migrating-from-the-old-watcher)
@@ -58,6 +59,9 @@ Private MAKIMA Alerts
 - **Mention alerts** — Telegram's own mention flag, a literal `@yourname` in the
   text, and hidden text-mentions of your account.
 - **Reply alerts** — when somebody replies to a message you sent.
+- **Watched members** — tag alerts with the person mentioned (`#THOMAS`), kept
+  separate from the admin list.
+- **One-tap deep links** — every alert carries an inline OPEN MESSAGE button.
 - **Private bot control panel** — add and remove keywords, flip modes, change
   the alert template, all from a Telegram chat. No SSH, no file editing.
 - **Live config updates** — every change is written to disk immediately and
@@ -82,10 +86,11 @@ chats and your own outgoing messages are skipped before anything else happens.
 | **Reply** | Somebody replies to a message your account sent |
 | **Keyword** | The text contains one of the keywords in `data/keywords.txt` |
 
-A single message can trigger for several reasons at once, and the alert says so:
+A single message can trigger for several reasons at once, and the alert says so
+on its trigger line:
 
 ```
-Reason: 🟥 Mention | 🔍 Keyword: fuel card
+MENTION • FUEL CARD
 ```
 
 Messages that trigger nothing cost one regex pass and are dropped.
@@ -375,51 +380,110 @@ crashes startup. A file that is not valid JSON is copied aside as
 
 ---
 
-## Alert template
+## Alert format
 
-The default alert looks like this:
+An alert reads like a short instruction from a supervisor, not a monitoring
+dump:
 
 ```
-🟥 𝐌𝐀𝐊𝐈𝐌𝐀 𝐀𝐋𝐄𝐑𝐓
-━━━━━━━━━━━━━━━━━━
-🕒 2026-08-24 14:03:11 UTC
-🧠 Reason: 🟥 Mention | 🔍 Keyword: fuel card
-👥 Group: Dispatch Team
-🔗 Group Link: https://t.me/c/1234567890
-👤 From: Alex Driver (@alexdriver)
-🧷 Keyword hits: fuel card
-📝 Message:
-My fuel card is declining and I only have 8% left.
-──────────────────
-👉 Message: https://t.me/c/1234567890/48213
+#SAFETY
+
+🔴 LOOK AT THIS.
+INSURANCE • DAMAGE
+
+👤 Aiubkhon
+🏢 ESL Trucking Incorporated- APD Fleet-ASAP
+
+📄 Insurance Requirement
+Please provide the following insurance documents before equipment pickup...
+
+⚠️ DON'T LEAVE IT UNATTENDED.
+
+          [ 🔗 OPEN MESSAGE ]
 ```
 
-Available placeholders:
+**The tag line.** `#SAFETY` by default. If a [watched member](#watched-members)
+is mentioned in the message, their tag replaces it — `#THOMAS`, or
+`#RAYN #THOMAS` when several are mentioned at once.
+
+**The trigger line.** What fired, uppercase, joined by `•`: keyword hits
+(`INSURANCE • DAMAGE`), `MENTION`, `REPLY`, or a combination
+(`MENTION • INSURANCE`). Mention and reply come first, then keywords.
+
+**The heading.** If the message's first line looks like a title — short, no
+sentence punctuation, with a body underneath — it is shown as `📄 Title` and the
+rest follows below. Detection is deliberately conservative; a title is never
+invented for a message that does not have one.
+
+**The button.** The message link is an inline button, not text. Public groups
+give `https://t.me/<username>/<id>`; private supergroups give
+`https://t.me/c/<internal id>/<id>` with the `-100` prefix stripped. Legacy
+basic groups have no link form in Telegram — those alerts simply arrive without
+a button rather than showing a dead one.
+
+### Placeholders
+
+The template is still fully customisable via `/settemplate` or the panel.
 
 | Placeholder | Value |
 | --- | --- |
-| `{{timestamp}}` | Message time, formatted per `formatting.timestamp_format` |
-| `{{reasons}}` | `🟥 Mention`, `🧷 Reply`, `🔍 Keyword: <word>`, joined by ` \| ` |
-| `{{group}}` | Group title |
-| `{{group_link}}` | `https://t.me/<username>` or `https://t.me/c/<id>` |
+| `{{tags}}` | `#SAFETY`, or the mentioned members' tags |
+| `{{triggers}}` | `INSURANCE • DAMAGE`, `MENTION`, `REPLY`, or a mix |
 | `{{sender}}` | Display name plus `(@username)` when there is one |
-| `{{sender_name}}` | Display name only |
-| `{{sender_username}}` | `@username` or `-` |
-| `{{sender_id}}` | Numeric sender ID |
-| `{{chat_id}}` | Numeric chat ID |
-| `{{message_id}}` | Numeric message ID |
-| `{{keyword_hits}}` | Matched keywords, capped by `max_keyword_preview` |
-| `{{message_text}}` | Message text, truncated to `max_message_chars` |
-| `{{message_link}}` | Direct link to the message |
-| `{{category}}` `{{severity}}` `{{summary}}` `{{requires_action}}` `{{unit}}` | Filled once AI classification is enabled; `-` otherwise |
+| `{{group}}` | Group title |
+| `{{heading}}` | `📄 Title`, or empty when the message has no heading |
+| `{{body}}` | Message text, truncated to `max_message_chars` |
+| `{{message_block}}` | Heading and body together, laid out correctly either way |
 
-Message links are built correctly for both kinds of group: public groups get
-`https://t.me/<username>/<message_id>`, private supergroups get
-`https://t.me/c/<internal_id>/<message_id>` with the `-100` prefix stripped.
-Legacy basic groups have no link form in Telegram, so those fields show `-`.
+These older placeholders still work, so a custom template written against the
+previous format keeps rendering: `{{timestamp}}`, `{{reasons}}`,
+`{{group_link}}`, `{{sender_name}}`, `{{sender_username}}`, `{{sender_id}}`,
+`{{chat_id}}`, `{{message_id}}`, `{{keyword_hits}}`, `{{message_text}}`,
+`{{message_link}}`, plus `{{category}}` `{{severity}}` `{{summary}}`
+`{{requires_action}}` `{{unit}}` for the optional AI layer.
 
-Alerts are sent as plain text with no parse mode, so message content containing
-`*`, `_` or `[` can never break formatting or inject markup.
+If your stored template is still the one this project shipped originally, it is
+upgraded to the new format automatically on the next start. A template **you**
+edited is never overwritten — send `/settemplate default`, or tap
+**📝 Template → ♻️ Reset Default**, when you want the new one.
+
+Alerts are sent with no parse mode at all, so a sender name, group title or
+message body containing `*`, `_` or `[` cannot break the formatting or inject
+markup. The button is a separate part of the message, never text.
+
+---
+
+## Watched members
+
+Watched members are the people whose Telegram mentions get their own tag on an
+alert. **This is not the admin list.** `ADMIN_USER_IDS` controls who may use the
+bot and receive alerts; being an admin does not make you watched, and a watched
+member needs no admin rights.
+
+They live in `data/watched_users.json`, on the Docker volume alongside your
+keywords and settings:
+
+```json
+{
+  "members": [
+    {"tag": "RAYN",   "user_id": 8361140465, "username": "Rayn_ST"},
+    {"tag": "THOMAS", "user_id": 123456789,  "username": "thomas_username"}
+  ]
+}
+```
+
+Each entry needs a `tag` plus a `user_id` and/or a `username`. Tags are
+uppercased and stripped to hashtag-safe characters. After editing, send
+`/reload` to the bot — no restart needed.
+
+Matching is exact, never fuzzy. A member is detected only by a literal
+`@username` on a word boundary, or by a Telegram text-mention entity carrying
+their numeric user ID. A first name appearing as an ordinary word in a sentence
+never matches, so adding someone called "Mark" will not fire on "mark the
+trailer".
+
+Mentions of watched members respect the **Mentions** toggle, and the keyword
+list stays global — there is no per-member keyword list.
 
 ---
 
@@ -778,6 +842,7 @@ telegram-watcher/
 │   ├── control_panel.py      # inline keyboard + typed-input flows
 │   ├── alerts.py             # alert formatting + delivery queue
 │   ├── keywords.py           # keyword storage and matching
+│   ├── watched_users.py      # watched members and mention matching
 │   ├── settings.py           # settings with deep-merge and atomic writes
 │   ├── utils.py              # links, templates, atomic file writes
 │   ├── logging_config.py     # rotating log + secret redaction

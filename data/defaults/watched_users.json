@@ -1,0 +1,9 @@
+{
+  "_readme": "People whose Telegram mentions MAKIMA should tag in alerts. This is NOT the admin list - ADMIN_USER_IDS controls who can use the bot. Add someone here only if a mention of them in a watched group should raise a tagged alert. Each entry needs a 'tag' plus a 'user_id' and/or a 'username'. Matching is exact: a literal @username on a word boundary, or a Telegram text-mention carrying the numeric user id. Plain names in ordinary text never match. Send /reload to the bot after editing this file - no restart needed.",
+  "_example": {
+    "tag": "RAYN",
+    "user_id": 8361140465,
+    "username": "Rayn_ST"
+  },
+  "members": []
+}

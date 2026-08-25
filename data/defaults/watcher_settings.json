@@ -8,7 +8,7 @@
     "include_message_text": true,
     "max_message_chars": 500,
     "max_keyword_preview": 8,
-    "template": "🟥 𝐌𝐀𝐊𝐈𝐌𝐀 𝐀𝐋𝐄𝐑𝐓\n━━━━━━━━━━━━━━━━━━\n🕒 {{timestamp}}\n🧠 Reason: {{reasons}}\n👥 Group: {{group}}\n🔗 Group Link: {{group_link}}\n👤 From: {{sender}}\n🧷 Keyword hits: {{keyword_hits}}\n📝 Message:\n{{message_text}}\n──────────────────\n👉 Message: {{message_link}}"
+    "template": "{{tags}}\n\n🔴 LOOK AT THIS.\n{{triggers}}\n\n👤 {{sender}}\n🏢 {{group}}\n\n{{message_block}}\n\n⚠️ DON'T LEAVE IT UNATTENDED."
   },
   "formatting": {
     "timestamp_format": "%Y-%m-%d %H:%M:%S UTC"

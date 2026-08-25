@@ -82,6 +82,7 @@ class BotCommands:
         admin_ids: Callable[[], Iterable[int]],
         watcher: Any = None,
         dispatcher: Any = None,
+        watched: Any = None,
         identity: dict[str, Any] | None = None,
     ) -> None:
         self._bot = bot_client
@@ -96,6 +97,7 @@ class BotCommands:
             keywords=keywords,
             watcher=watcher,
             dispatcher=dispatcher,
+            watched=watched,
             identity=self._identity,
         )
         self.panel = ControlPanel(

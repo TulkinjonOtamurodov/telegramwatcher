@@ -97,6 +97,10 @@ class Config:
         return self.data_dir / "watcher_settings.json"
 
     @property
+    def watched_users_file(self) -> Path:
+        return self.data_dir / "watched_users.json"
+
+    @property
     def defaults_dir(self) -> Path:
         return self.data_dir / "defaults"
 

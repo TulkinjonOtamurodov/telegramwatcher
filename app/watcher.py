@@ -41,11 +41,13 @@ class Watcher:
         settings: SettingsStore,
         keywords: KeywordStore,
         dispatcher: AlertDispatcher,
+        watched: Any = None,
     ) -> None:
         self._client = user_client
         self._settings = settings
         self._keywords = keywords
         self._dispatcher = dispatcher
+        self._watched = watched
 
         self._me_id: int | None = None
         self._me_username: str | None = None
@@ -148,8 +150,17 @@ class Watcher:
 
         reasons: list[str] = []
 
-        if settings.watch_mentions and self._is_mention(event, text):
-            reasons.append(REASON_MENTION)
+        # A mention of a configured watched member tags the alert with that
+        # person; a mention of my own account falls back to the default tag.
+        watched_tags: list[str] = []
+        if settings.watch_mentions:
+            entities = getattr(event.message, "entities", None)
+            if self._watched is not None:
+                watched_tags = [
+                    member.tag for member in self._watched.find_mentions(text, entities)
+                ]
+            if watched_tags or self._is_mention(event, text):
+                reasons.append(REASON_MENTION)
 
         if settings.watch_replies and await self._is_reply_to_me(event):
             reasons.append(REASON_REPLY)
@@ -166,9 +177,15 @@ class Watcher:
         if not reasons:
             return
 
-        await self._raise_alert(event, reasons, keyword_hits)
+        await self._raise_alert(event, reasons, keyword_hits, watched_tags)
 
-    async def _raise_alert(self, event: Any, reasons: list[str], keyword_hits: list[str]) -> None:
+    async def _raise_alert(
+        self,
+        event: Any,
+        reasons: list[str],
+        keyword_hits: list[str],
+        tags: list[str] | None = None,
+    ) -> None:
         try:
             chat = await event.get_chat()
         except (RPCError, ConnectionError, OSError, ValueError) as exc:
@@ -205,7 +222,7 @@ class Watcher:
             )
             return
 
-        text = build_alert(
+        alert = build_alert(
             event,
             reasons=reasons,
             keyword_hits=keyword_hits,
@@ -214,9 +231,10 @@ class Watcher:
             chat=chat,
             settings=self._settings,
             classification=classification,
+            tags=tags,
         )
 
-        await self._dispatcher.enqueue(text)
+        await self._dispatcher.enqueue(alert)
         self.alerts_raised += 1
 
         summary = ", ".join(reasons[:4]) + ("..." if len(reasons) > 4 else "")

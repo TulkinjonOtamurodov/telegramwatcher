@@ -119,6 +119,49 @@ def template_placeholders(template: str) -> set[str]:
     return {match.group(1) for match in _PLACEHOLDER_RE.finditer(template)}
 
 
+#: A first line longer than this is prose, not a heading.
+HEADING_MAX_CHARS = 60
+HEADING_MAX_WORDS = 8
+
+#: Sentence-ending punctuation means the line is a sentence, not a title.
+_HEADING_REJECT_SUFFIX = (".", "!", "?", ",", ";")
+
+#: Bullets, list numbering and hashtags start a line of content, not a title.
+_HEADING_REJECT_PREFIX = "-*•>#+0123456789"
+
+
+def split_heading(text: str) -> tuple[str | None, str]:
+    """Split a leading title line off a message, if it plausibly has one.
+
+    Deliberately conservative: a heading is only recognised when the message has
+    a short, punctuation-free first line *and* something underneath it. When in
+    doubt the whole message is returned as the body, because inventing a title
+    the sender did not write would be worse than showing none.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return None, ""
+
+    lines = stripped.splitlines()
+    if len(lines) < 2:
+        return None, stripped
+
+    first = lines[0].strip()
+    rest = "\n".join(lines[1:]).strip()
+    if not first or not rest:
+        return None, stripped
+    if len(first) > HEADING_MAX_CHARS:
+        return None, stripped
+    if len(first.split()) > HEADING_MAX_WORDS:
+        return None, stripped
+    if first.endswith(_HEADING_REJECT_SUFFIX):
+        return None, stripped
+    if first[0] in _HEADING_REJECT_PREFIX:
+        return None, stripped
+
+    return first, rest
+
+
 def chunk_text(text: str, limit: int = TELEGRAM_MAX_MESSAGE - 96) -> Iterator[str]:
     """Split a long reply into Telegram-sized pieces, preferring line breaks."""
     if not text:
@@ -182,15 +225,29 @@ def build_group_link(chat: Any, fallback: str = "-") -> str:
     return fallback
 
 
-def build_message_link(chat: Any, message_id: int, fallback: str = "-") -> str:
+def message_url(chat: Any, message_id: int | None) -> str | None:
+    """Deep link to one message, or ``None`` when Telegram has no link form.
+
+    Public groups and channels use ``t.me/<username>/<id>``; private supergroups
+    use ``t.me/c/<internal id>/<id>``. Legacy basic groups have neither, and
+    neither does a message with no id -- both return ``None`` so the caller can
+    omit the button rather than render a dead link.
+    """
+    if not message_id:
+        return None
     username = chat_username(chat)
     if username:
         return f"https://t.me/{username}/{message_id}"
     if is_channel(chat):
         chat_id = normalize_channel_id(getattr(chat, "id", 0))
-        return f"https://t.me/c/{chat_id}/{message_id}"
-    # Legacy basic groups have no public or private deep-link form.
-    return fallback
+        if chat_id:
+            return f"https://t.me/c/{chat_id}/{message_id}"
+    return None
+
+
+def build_message_link(chat: Any, message_id: int, fallback: str = "-") -> str:
+    """String form of :func:`message_url`, for template placeholders."""
+    return message_url(chat, message_id) or fallback
 
 
 def display_name(entity: Any, fallback: str = "Unknown") -> str:

@@ -41,6 +41,13 @@ WATCH_MODES: dict[str, tuple[str, str]] = {
 }
 
 KNOWN_PLACEHOLDERS = {
+    # -- used by the current default template --
+    "tags",
+    "triggers",
+    "heading",
+    "body",
+    "message_block",
+    # -- still supported, for older custom templates --
     "timestamp",
     "reasons",
     "group",
@@ -80,12 +87,14 @@ class MakimaActions:
         keywords: KeywordStore,
         watcher: Any = None,
         dispatcher: Any = None,
+        watched: Any = None,
         identity: dict[str, Any] | None = None,
     ) -> None:
         self.settings = settings
         self.keywords = keywords
         self.watcher = watcher
         self.dispatcher = dispatcher
+        self.watched = watched
         self.identity = identity or {}
         self._started_at = time.monotonic()
 
@@ -175,9 +184,11 @@ class MakimaActions:
         logger.info("Alert template reset to the default")
 
     async def reload(self) -> None:
-        """Re-read both files from disk without restarting the process."""
+        """Re-read every data file from disk without restarting the process."""
         await self.settings.load()
         await self.keywords.load()
+        if self.watched is not None:
+            await self.watched.load()
         logger.info("Reloaded settings and %d keywords from disk", self.keywords.count())
 
     # -- rendered views ---------------------------------------------------- #
@@ -190,6 +201,7 @@ class MakimaActions:
             f"Replies: {on_off(settings.watch_replies)}",
             f"Keywords: {on_off(settings.watch_keywords)}",
             f"Keywords loaded: {self.keywords.count()}",
+            f"Watched members: {self.watched.count() if self.watched else 0}",
             f"Max preview chars: {settings.max_message_chars}",
             f"AI classification: {on_off(settings.ai_enabled)}"
             + (
@@ -244,5 +256,6 @@ class MakimaActions:
         return (
             "\U0001f504 Reloaded from disk.\n"
             f"Keywords loaded: {self.keywords.count()}\n"
+            f"Watched members: {self.watched.count() if self.watched else 0}\n"
             f"Modes: {self.settings.modes_summary()}"
         )

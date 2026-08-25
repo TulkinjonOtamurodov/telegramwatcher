@@ -19,7 +19,26 @@ from app.utils import atomic_write_text, deep_merge, get_by_path, set_by_path
 
 logger = get_logger("settings")
 
+#: The alert format: a short instruction from a supervisor, not a system dump.
+#: The message link is not printed -- it becomes an inline button instead.
 DEFAULT_TEMPLATE = (
+    "{{tags}}\n"
+    "\n"
+    "\U0001f534 LOOK AT THIS.\n"
+    "{{triggers}}\n"
+    "\n"
+    "\U0001f464 {{sender}}\n"
+    "\U0001f3e2 {{group}}\n"
+    "\n"
+    "{{message_block}}\n"
+    "\n"
+    "⚠️ DON'T LEAVE IT UNATTENDED."
+)
+
+#: Every default this project has shipped. A stored template matching one of
+#: these was never customised, so it is safe to upgrade in place; anything else
+#: is the user's own work and is left exactly as it is.
+_TEMPLATE_V1 = (
     "\U0001f7e5 \U0001d40c\U0001d400\U0001d40a\U0001d408\U0001d40c\U0001d400 "
     "\U0001d400\U0001d40b\U0001d404\U0001d411\U0001d413\n"
     "━━━━━━━━━"
@@ -36,6 +55,8 @@ DEFAULT_TEMPLATE = (
     "─────────\n"
     "\U0001f449 Message: {{message_link}}"
 )
+
+LEGACY_TEMPLATES: tuple[str, ...] = (_TEMPLATE_V1,)
 
 #: Every setting the application understands, with its shipped default.
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -143,7 +164,30 @@ class SettingsStore:
             logger.error("Settings file %s must contain a JSON object; using defaults", self._path)
             return seed
 
-        return deep_merge(seed, raw)
+        merged = deep_merge(seed, raw)
+        if self._migrate(merged):
+            atomic_write_text(
+                self._path, json.dumps(merged, indent=2, ensure_ascii=False) + "\n"
+            )
+        return merged
+
+    @staticmethod
+    def _migrate(data: dict[str, Any]) -> bool:
+        """Upgrade an untouched shipped template. Returns True if changed.
+
+        A template the user has edited is never overwritten -- only one that is
+        byte-identical to a previous release's default, which means they never
+        customised it and would otherwise be stuck on the old format forever.
+        """
+        stored = get_by_path(data, "alerts.template")
+        if isinstance(stored, str) and stored in LEGACY_TEMPLATES:
+            set_by_path(data, "alerts.template", DEFAULT_TEMPLATE)
+            logger.info(
+                "Alert template was still the previous shipped default; "
+                "upgraded it to the current one. Send /template to review it."
+            )
+            return True
+        return False
 
     async def load(self) -> None:
         """(Re)read the settings file."""
