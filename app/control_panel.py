@@ -28,6 +28,7 @@ from telethon.errors import (
 )
 
 from app.actions import ActionError, MakimaActions, on_off
+from app.alert_lifecycle import CB_ALERT_SEEN
 from app.logging_config import get_logger
 from app.settings import MAX_MESSAGE_CHARS, MIN_MESSAGE_CHARS
 from app.utils import TELEGRAM_MAX_MESSAGE, truncate
@@ -59,6 +60,10 @@ CB_PREVIEW = b"P"
 CB_PREVIEW_CUSTOM = b"PC"
 CB_RELOAD = b"R"
 CB_CANCEL = b"X"
+CB_EXCLUSIONS = b"E"
+CB_EXC_LIST = b"EL"
+CB_EXC_ADD = b"EA"
+CB_EXC_DEL = b"ED"
 
 _PREVIEW_PREFIX = b"PV"
 
@@ -67,6 +72,8 @@ ADD_KEYWORD = "add_keyword"
 REMOVE_KEYWORD = "remove_keyword"
 SET_TEMPLATE = "set_template"
 SET_MAX_CHARS = "set_max_chars"
+EXCLUDE_CHAT = "exclude_chat"
+ALLOW_CHAT = "allow_chat"
 
 _PROMPTS: dict[str, str] = {
     ADD_KEYWORD: (
@@ -88,6 +95,17 @@ _PROMPTS: dict[str, str] = {
         "✏️ CUSTOM PREVIEW LENGTH\n\n"
         f"Send a number between {MIN_MESSAGE_CHARS} and {MAX_MESSAGE_CHARS}."
     ),
+    EXCLUDE_CHAT: (
+        "➕ EXCLUDE A GROUP\n\n"
+        "Send the group's chat id, e.g. -1001234567890.\n\n"
+        "Easier: send /excludekeywords inside the group itself — the id is "
+        "then picked up automatically."
+    ),
+    ALLOW_CHAT: (
+        "➖ REMOVE AN EXCLUSION\n\n"
+        "Send the chat id to re-enable keyword alerts for.\n"
+        "Tap 📋 Excluded Groups first if you need the id."
+    ),
 }
 
 #: Which menu each input flow returns to once it completes.
@@ -96,6 +114,8 @@ _RETURN_VIEW: dict[str, str] = {
     REMOVE_KEYWORD: "keywords",
     SET_TEMPLATE: "template",
     SET_MAX_CHARS: "preview",
+    EXCLUDE_CHAT: "exclusions",
+    ALLOW_CHAT: "exclusions",
 }
 
 
@@ -160,7 +180,23 @@ class ControlPanel:
             ],
             [
                 Button.inline(f"📏 Preview: {act.max_chars}", CB_PREVIEW),
-                Button.inline("🔄 Reload", CB_RELOAD),
+                Button.inline(
+                    f"🚫 Exclusions: {act.excluded_count()}", CB_EXCLUSIONS
+                ),
+            ],
+            [Button.inline("🔄 Reload", CB_RELOAD)],
+        ]
+
+    @staticmethod
+    def _exclusions_keyboard() -> list[list[Any]]:
+        return [
+            [
+                Button.inline("➕ Exclude Group", CB_EXC_ADD),
+                Button.inline("➖ Remove Exclusion", CB_EXC_DEL),
+            ],
+            [
+                Button.inline("📋 Excluded Groups", CB_EXC_LIST),
+                Button.inline("⬅️ Back", CB_MAIN),
             ],
         ]
 
@@ -223,6 +259,20 @@ class ControlPanel:
             body = act.template_text(with_placeholders=False)
             return prefix + body, self._template_keyboard()
 
+        if name == "exclusions":
+            body = (
+                "🚫 KEYWORD EXCLUSIONS\n\n"
+                f"Groups excluded: {act.excluded_count()}\n\n"
+                "In an excluded group, keyword matches are ignored — but "
+                "mentions of watched members and replies to you still alert.\n\n"
+                "Quickest way to exclude one: send /excludekeywords inside the "
+                "group itself."
+            )
+            return prefix + body, self._exclusions_keyboard()
+
+        if name == "exclusions_list":
+            return prefix + act.exclusions_text(), self._exclusions_keyboard()
+
         if name == "preview":
             body = (
                 "📏 ALERT PREVIEW LENGTH\n\n"
@@ -254,6 +304,12 @@ class ControlPanel:
 
     # -- callback handling -------------------------------------------------- #
     async def _on_callback(self, event: Any) -> None:
+        # Alert buttons belong to app.alert_lifecycle, which is registered first
+        # and stops propagation. This guard is belt-and-braces: if the ordering
+        # ever changes, the panel still must not redraw somebody's alert.
+        if bytes(getattr(event, "data", b"") or b"") == CB_ALERT_SEEN:
+            return
+
         sender_id = getattr(event, "sender_id", None)
 
         if not self._is_authorized(sender_id):
@@ -281,7 +337,15 @@ class ControlPanel:
         # would be swallowed by that implicit empty answer.
 
         # --- navigation: entering any menu abandons a half-finished input ---
-        if data in (CB_MAIN, CB_STATUS, CB_KEYWORDS, CB_TEMPLATE, CB_PREVIEW):
+        if data in (
+            CB_MAIN,
+            CB_STATUS,
+            CB_KEYWORDS,
+            CB_TEMPLATE,
+            CB_PREVIEW,
+            CB_EXCLUSIONS,
+            CB_EXC_LIST,
+        ):
             self._pending.pop(sender_id, None)
             view = {
                 CB_MAIN: "main",
@@ -289,6 +353,8 @@ class ControlPanel:
                 CB_KEYWORDS: "keywords",
                 CB_TEMPLATE: "template",
                 CB_PREVIEW: "preview",
+                CB_EXCLUSIONS: "exclusions",
+                CB_EXC_LIST: "exclusions_list",
             }[data]
             await self._answer(event)
             await self._render(event, *self._view(view))
@@ -315,6 +381,8 @@ class ControlPanel:
             CB_KW_DEL: REMOVE_KEYWORD,
             CB_TPL_SET: SET_TEMPLATE,
             CB_PREVIEW_CUSTOM: SET_MAX_CHARS,
+            CB_EXC_ADD: EXCLUDE_CHAT,
+            CB_EXC_DEL: ALLOW_CHAT,
         }
         if data in prompt_map:
             await self._begin_input(event, sender_id, prompt_map[data])
@@ -427,6 +495,12 @@ class ControlPanel:
             elif action == SET_MAX_CHARS:
                 value = await act.set_max_chars(raw)
                 note = f"✅ Preview length set to {value}."
+            elif action == EXCLUDE_CHAT:
+                label = await act.exclude_chat(raw.strip())
+                note = f"✅ Keyword alerts disabled for {label}."
+            elif action == ALLOW_CHAT:
+                label = await act.allow_chat(raw.strip())
+                note = f"✅ Keyword alerts enabled for {label}."
             else:  # pragma: no cover - guarded by _RETURN_VIEW
                 self._pending.pop(sender_id, None)
                 return

@@ -41,6 +41,8 @@ Private MAKIMA Alerts
 - [Configuration files](#configuration-files)
 - [Alert format](#alert-format)
 - [Watched members](#watched-members)
+- [Keyword exclusions](#keyword-exclusions)
+- [Alert lifecycle](#alert-lifecycle)
 - [Hostinger VPS deployment](#hostinger-vps-deployment)
 - [Updating](#updating)
 - [Migrating from the old watcher](#migrating-from-the-old-watcher)
@@ -62,6 +64,10 @@ Private MAKIMA Alerts
 - **Watched members** — tag alerts with the person mentioned (`#THOMAS`), kept
   separate from the admin list.
 - **One-tap deep links** — every alert carries an inline OPEN MESSAGE button.
+- **Per-group keyword exclusions** — silence keyword alerts in noisy groups
+  while mentions and replies keep working.
+- **Self-clearing alerts** — tap SEEN and the alert removes itself after five
+  minutes.
 - **Private bot control panel** — add and remove keywords, flip modes, change
   the alert template, all from a Telegram chat. No SSH, no file editing.
 - **Live config updates** — every change is written to disk immediately and
@@ -153,6 +159,9 @@ setmaxchars - Message preview length
 template - Show the alert template
 settemplate - Replace the alert template
 reload - Re-read keywords and settings
+excludekeywords - Silence keyword alerts for a group
+allowkeywords - Re-enable keyword alerts for a group
+keywordexclusions - List keyword-excluded groups
 ```
 
 To revoke a leaked token: BotFather → `/mybots` → your bot → **API Token** →
@@ -274,12 +283,14 @@ Watcher controls and alert settings.
 [ 📊 Status        ] [ 🔑 Keywords      ]
 [ 👤 Mentions: ON  ] [ ↩️ Replies: ON   ]
 [ 🎯 Keywords: ON  ] [ 📝 Template      ]
-[ 📏 Preview: 500  ] [ 🔄 Reload        ]
+[ 📏 Preview: 500  ] [ 🚫 Exclusions: 0 ]
+[ 🔄 Reload        ]
 ```
 
 The three mode buttons show live state and toggle on tap. **Keywords** opens an
-add/remove menu, **Template** lets you replace or reset the alert format, and
-**Preview** offers 200/500/1000/2000 or a custom value.
+add/remove menu, **Template** lets you replace or reset the alert format,
+**Preview** offers 200/500/1000/2000 or a custom value, and **Exclusions**
+manages the groups where keyword matching is skipped.
 
 Buttons that need typed input (add or remove a keyword, a new template, a custom
 preview length) prompt you and consume your next message, with a **❌ Cancel**
@@ -303,6 +314,9 @@ the panel persist identically. The commands below all still work.
 | `/template` | Shows the current alert template |
 | `/settemplate <text>` | Replaces the template. Multi-line is fine; a literal `\n` also becomes a line break. `/settemplate default` restores the shipped one |
 | `/reload` | Re-reads `keywords.txt` and `watcher_settings.json` from disk without restarting |
+| `/excludekeywords` | Run **inside a group** to silence keyword alerts there. From private chat, pass a chat id |
+| `/allowkeywords` | Undo it, in the group or by id |
+| `/keywordexclusions` | List the excluded groups with their ids |
 
 Example `/status` output:
 
@@ -415,11 +429,27 @@ sentence punctuation, with a body underneath — it is shown as `📄 Title` and
 rest follows below. Detection is deliberately conservative; a title is never
 invented for a message that does not have one.
 
-**The button.** The message link is an inline button, not text. Public groups
-give `https://t.me/<username>/<id>`; private supergroups give
+**The buttons.** The message link is an inline button, never text:
+
+```
+[ 🔗 OPEN MESSAGE ]
+[ ✅ SEEN — DELETE IN 5 MIN ]
+```
+
+Public groups give `https://t.me/<username>/<id>`; private supergroups give
 `https://t.me/c/<internal id>/<id>` with the `-100` prefix stripped. Legacy
-basic groups have no link form in Telegram — those alerts simply arrive without
-a button rather than showing a dead one.
+basic groups have no link form in Telegram — those alerts arrive with only the
+dismiss button rather than a dead link. Every link is built by one helper,
+`build_message_url()` in `app/utils.py`, which also reports why a link could not
+be made so the reason lands in the log.
+
+**Tapping SEEN** deletes that alert from your bot chat five minutes later. The
+original group message is never touched. Each recipient's copy is tracked
+separately — one admin dismissing theirs leaves everyone else's alone.
+
+Telegram never tells a bot that a URL button was pressed, so the dismiss button
+has to be a separate callback button. See
+[Alert lifecycle](#alert-lifecycle) for the detail.
 
 ### Placeholders
 
@@ -484,6 +514,113 @@ trailer".
 
 Mentions of watched members respect the **Mentions** toggle, and the keyword
 list stays global — there is no per-member keyword list.
+
+---
+
+## Keyword exclusions
+
+Some groups say *insurance*, *claim*, *damage* or *fuel* all day long as normal
+conversation. Excluding such a group stops **keyword** alerts there and nothing
+else:
+
+| In an excluded group | Result |
+| --- | --- |
+| Keyword match only | no alert |
+| Watched-member mention | **still alerts** |
+| Reply to one of your messages | **still alerts** |
+| Mention + keyword | **still alerts** — the mention is a valid trigger |
+| Reply + keyword | **still alerts** — the reply is a valid trigger |
+
+Excluding a group never stops the watcher for that group.
+
+### How to exclude one
+
+The easiest and most reliable way is to run the command **inside the group**,
+from the account MAKIMA is signed in as:
+
+```
+/excludekeywords
+```
+
+The chat id comes straight off that message — nothing to look up, nothing to
+type. The confirmation arrives in your private bot chat rather than the group,
+so nobody else sees it. The command message itself stays in the group; delete it
+yourself if you would rather it were not there.
+
+To undo, in the same group:
+
+```
+/allowkeywords
+```
+
+From the private bot chat you can also pass an id directly, or use the panel's
+**🚫 Exclusions** menu:
+
+```
+/excludekeywords -1001234567890
+/allowkeywords -1001234567890
+/keywordexclusions
+```
+
+### How they are stored
+
+In `data/watcher_settings.json`, keyed by **Telegram chat id** — titles change,
+ids do not. The title is kept alongside purely for display:
+
+```json
+{
+  "keyword_excluded_chats": {
+    "-1001234567890": "Claims Discussion",
+    "-1009876543210": "Insurance Team"
+  }
+}
+```
+
+That file is on the Docker volume, so exclusions survive restarts and rebuilds
+like every other setting. The keyword list itself stays global in
+`data/keywords.txt` — there are no per-group keyword lists.
+
+`/status` shows the count; the full list lives in `/keywordexclusions`.
+
+---
+
+## Alert lifecycle
+
+**Telegram does not tell a bot when a URL button is pressed.** A URL button is
+handled entirely inside the client: it opens the link and sends nothing to the
+server. There is no update, no callback, no counter. The bot genuinely cannot
+know. (The one exception, `urlAuth` / Login URL buttons, is an OAuth handshake
+for external websites registered with BotFather, and does not apply to `t.me`
+deep links.)
+
+So "delete the alert after I open it" cannot be implemented literally. Instead
+each alert carries two buttons:
+
+```
+[ 🔗 OPEN MESSAGE ]           <- real URL button, opens the message
+[ ✅ SEEN — DELETE IN 5 MIN ]  <- callback button, the one we can detect
+```
+
+Tapping **SEEN**:
+
+1. acknowledges the callback so the spinner clears;
+2. greys the button to `🕒 Deleting in 5 min…`, leaving the link usable;
+3. schedules deletion of *that copy* five minutes later.
+
+Deletion runs as its own asyncio task, so it never blocks the watcher and one
+alert's timer is independent of any other. Deleting an alert that is already
+gone is logged at INFO and ignored. **Only MAKIMA's copy in your bot chat is
+deleted — the original group message is never touched.**
+
+Multiple recipients are handled separately: every delivered copy has its own
+chat id and message id, and the callback identifies exactly the one that was
+tapped. If one admin dismisses their alert, everyone else's stays.
+
+**Known limitation:** the timers are in memory. A container restart within the
+five-minute window cancels the pending deletions and those alerts simply stay in
+the chat. That is a deliberate trade — persisting a five-minute timer would mean
+a disk write per alert and a rehydration pass at startup, for a window most
+restarts never hit.
 
 ---
 
@@ -841,6 +978,7 @@ telegram-watcher/
 │   ├── bot_commands.py       # slash-command dispatch
 │   ├── control_panel.py      # inline keyboard + typed-input flows
 │   ├── alerts.py             # alert formatting + delivery queue
+│   ├── alert_lifecycle.py    # dismiss button and deletion timers
 │   ├── keywords.py           # keyword storage and matching
 │   ├── watched_users.py      # watched members and mention matching
 │   ├── settings.py           # settings with deep-merge and atomic writes

@@ -15,6 +15,7 @@ import sys
 from typing import Any
 
 from app import __version__
+from app.alert_lifecycle import AlertLifecycle
 from app.alerts import AlertDispatcher
 from app.bot_commands import BotCommands
 from app.clients import (
@@ -126,6 +127,7 @@ async def run() -> int:
     bot_client = build_bot_client(config)
 
     dispatcher: AlertDispatcher | None = None
+    lifecycle: AlertLifecycle | None = None
     monitor: ConnectionMonitor | None = None
     watcher: Any = None
     stop_event = asyncio.Event()
@@ -175,7 +177,13 @@ async def run() -> int:
                 "bot_username": getattr(bot_me, "username", None),
             },
         )
+        # Registered before the control panel so its StopPropagation keeps the
+        # panel from redrawing an alert when the dismiss button is tapped.
+        lifecycle = AlertLifecycle(bot_client, is_authorized=commands.is_authorized)
+        lifecycle.register()
+
         commands.register()
+        watcher.set_exclusion_handler(commands.handle_group_exclusion_command)
 
         monitor = ConnectionMonitor({"user": user_client, "bot": bot_client})
         await monitor.start()
@@ -217,6 +225,8 @@ async def run() -> int:
             await monitor.stop()
         if watcher is not None:
             await watcher.stop()
+        if lifecycle is not None:
+            await lifecycle.stop()
         if dispatcher is not None:
             await dispatcher.stop()
         await disconnect_quietly(user_client, "user")

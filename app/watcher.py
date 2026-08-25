@@ -15,6 +15,7 @@ from telethon import events
 from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.types import MessageEntityMentionName
 
+from app.actions import is_chat_excluded
 from app.ai_classifier import classify_message
 from app.alerts import (
     REASON_MENTION,
@@ -29,6 +30,13 @@ from app.settings import SettingsStore
 from app.utils import display_name
 
 logger = get_logger("watcher")
+
+#: Commands typed inside a watched group by my own account. Recognised on the
+#: user client because that is the only client actually in those groups -- the
+#: bot never joins one, and that separation is deliberate.
+GROUP_COMMAND_RE = re.compile(
+    r"^/(excludekeywords|allowkeywords)(?:@[\w_]+)?\s*$", re.IGNORECASE
+)
 
 
 class Watcher:
@@ -53,9 +61,18 @@ class Watcher:
         self._me_username: str | None = None
         self._mention_pattern: re.Pattern[str] | None = None
         self._registered = False
+        self._exclusion_handler: Any = None
 
         self.messages_seen = 0
         self.alerts_raised = 0
+
+    def set_exclusion_handler(self, handler: Any) -> None:
+        """Install the coroutine that applies ``/excludekeywords`` in a group.
+
+        Injected rather than imported so the watcher stays independent of the
+        bot-side command objects, which are built after it.
+        """
+        self._exclusion_handler = handler
 
     # -- lifecycle --------------------------------------------------------- #
     def bind_identity(self, me: Any) -> None:
@@ -79,6 +96,12 @@ class Watcher:
             raise RuntimeError("bind_identity() must be called before start()")
         # add_event_handler returns None, so track registration ourselves.
         self._client.add_event_handler(self._on_new_message, events.NewMessage(incoming=True))
+        # Exclusion commands are typed by my own account inside the target
+        # group, so the chat id comes straight off the event -- no guessing.
+        self._client.add_event_handler(
+            self._on_group_command,
+            events.NewMessage(outgoing=True, pattern=GROUP_COMMAND_RE),
+        )
         self._registered = True
         logger.info("Message watcher registered on the user client")
 
@@ -86,6 +109,7 @@ class Watcher:
         if self._registered:
             try:
                 self._client.remove_event_handler(self._on_new_message)
+                self._client.remove_event_handler(self._on_group_command)
             except Exception:  # pragma: no cover - client may already be gone
                 logger.debug("Could not remove the event handler", exc_info=True)
             self._registered = False
@@ -124,6 +148,46 @@ class Watcher:
             logger.warning("Failed to resolve replied message: it is no longer available")
             return False
         return getattr(replied, "sender_id", None) == self._me_id
+
+    # -- in-group exclusion commands ---------------------------------------- #
+    async def _on_group_command(self, event: Any) -> None:
+        """Apply ``/excludekeywords`` or ``/allowkeywords`` typed in a group.
+
+        Only fires on messages my own account sent (Telegram guarantees the
+        ``outgoing`` flag), so the person issuing it is the account owner. The
+        chat id is taken from the event itself, which is why this is the most
+        reliable of the possible flows -- no forwarding, no typing ids.
+        """
+        try:
+            if event.is_private or not (event.is_group or event.is_channel):
+                return
+            if self._exclusion_handler is None:
+                logger.warning("Exclusion command received before the handler was wired")
+                return
+
+            command = (event.pattern_match.group(1) or "").lower()
+            chat_id = getattr(event, "chat_id", None)
+            if chat_id is None:
+                logger.warning("Exclusion command with no resolvable chat id; ignored")
+                return
+
+            try:
+                chat = await event.get_chat()
+            except (RPCError, ConnectionError, OSError, ValueError):
+                chat = getattr(event, "chat", None)
+            title = display_name(chat, fallback=f"Chat {chat_id}")
+
+            logger.info(
+                "Group command /%s | chat=%s | group=%s", command, chat_id, title
+            )
+            await self._exclusion_handler(command, int(chat_id), title, event.sender_id)
+
+        except asyncio.CancelledError:
+            raise
+        except FloodWaitError as exc:
+            logger.warning("Flood wait (%ss) on a group command", exc.seconds)
+        except Exception:
+            logger.exception("Failed to handle an in-group exclusion command")
 
     # -- event handling ---------------------------------------------------- #
     async def _on_new_message(self, event: Any) -> None:
@@ -165,8 +229,17 @@ class Watcher:
         if settings.watch_replies and await self._is_reply_to_me(event):
             reasons.append(REASON_REPLY)
 
+        # A keyword-excluded chat skips keyword matching only. The mention and
+        # reply checks above already ran, so those still alert normally.
         keyword_hits: list[str] = []
-        if settings.watch_keywords and text:
+        chat_id = getattr(event, "chat_id", None)
+        if settings.watch_keywords and text and is_chat_excluded(settings, chat_id):
+            logger.debug(
+                "Keyword matching skipped | chat=%s | group=%s",
+                chat_id,
+                display_name(getattr(event, "chat", None), fallback="?"),
+            )
+        elif settings.watch_keywords and text:
             keyword_hits = self._keywords.find_hits(text)
             # The full hit list still drives the "+N more" counter in the alert;
             # only the reason line is capped, so it cannot run away.

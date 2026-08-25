@@ -28,14 +28,15 @@ from telethon.errors import (
     UserIsBlockedError,
 )
 
+from app.alert_lifecycle import CB_ALERT_SEEN, OPEN_MESSAGE_LABEL, SEEN_LABEL
 from app.logging_config import get_logger
 from app.settings import SettingsStore
 from app.utils import (
     TELEGRAM_MAX_MESSAGE,
     build_group_link,
     build_message_link,
+    build_message_url,
     display_name,
-    message_url,
     render_template,
     split_heading,
     truncate,
@@ -50,9 +51,6 @@ REASON_KEYWORD_PREFIX = "keyword:"
 
 #: Tag used when no watched member was mentioned.
 DEFAULT_TAG = "SAFETY"
-
-#: Label on the inline deep-link button.
-OPEN_MESSAGE_LABEL = "\U0001f517 OPEN MESSAGE"
 
 #: Separates the trigger words on the second line of an alert.
 TRIGGER_SEPARATOR = " • "
@@ -82,10 +80,15 @@ MAX_FLOOD_WAIT_SECONDS = 900
 
 @dataclass(frozen=True)
 class Alert:
-    """One rendered alert: the text, and optionally a link to button up."""
+    """One rendered alert: the text, an optional link, and its controls.
+
+    ``dismissible`` is False for system notices such as the startup message --
+    those get no buttons at all.
+    """
 
     text: str
     url: str | None = None
+    dismissible: bool = True
 
 
 def keyword_reason(keyword: str) -> str:
@@ -181,7 +184,25 @@ def build_alert(
     message_id = getattr(message, "id", 0) or 0
 
     group_name = display_name(chat, fallback="Unknown group")
-    url = message_url(chat, message_id)
+
+    # One central helper decides the link; here we only report what it decided.
+    url, kind = build_message_url(
+        chat, message_id, chat_id=getattr(event, "chat_id", None)
+    )
+    if url:
+        logger.info(
+            "Message URL built | group=%s | msg=%s | url_type=%s",
+            group_name,
+            message_id,
+            kind,
+        )
+    else:
+        logger.warning(
+            "Message URL unavailable | group=%s | msg=%s | reason=%s",
+            group_name,
+            message_id,
+            kind,
+        )
 
     sender_display = sender_name or "Unknown"
     if sender_username:
@@ -316,8 +337,15 @@ class AlertDispatcher:
                 logger.error("Alert dropped: queue still full")
 
     async def send_now(self, alert: Alert | str) -> bool:
-        """Send immediately, bypassing the queue (used for the startup notice)."""
-        item = alert if isinstance(alert, Alert) else Alert(text=str(alert))
+        """Send immediately, bypassing the queue (used for the startup notice).
+
+        A plain string is a system notice, so it carries no buttons.
+        """
+        item = (
+            alert
+            if isinstance(alert, Alert)
+            else Alert(text=str(alert), dismissible=False)
+        )
         return await self._deliver(item)
 
     # -- worker ------------------------------------------------------------ #
@@ -351,14 +379,22 @@ class AlertDispatcher:
         return delivered_any
 
     @staticmethod
-    def _buttons(url: str | None) -> list[list[Any]] | None:
-        """The deep-link button, or nothing at all when there is no link."""
-        if not url:
+    def _buttons(alert: Alert, *, with_url: bool = True) -> list[list[Any]] | None:
+        """The deep-link button when there is a link, plus the dismiss button.
+
+        Telegram never reports a URL-button press, so the second (callback)
+        button is what tells us the admin is done with the alert.
+        """
+        if not alert.dismissible:
             return None
-        return [[Button.url(OPEN_MESSAGE_LABEL, url)]]
+        rows: list[list[Any]] = []
+        if alert.url and with_url:
+            rows.append([Button.url(OPEN_MESSAGE_LABEL, alert.url)])
+        rows.append([Button.inline(SEEN_LABEL, CB_ALERT_SEEN)])
+        return rows
 
     async def _send_to(self, recipient: int, alert: Alert) -> bool:
-        buttons = self._buttons(alert.url)
+        buttons = self._buttons(alert)
 
         for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
             try:
@@ -373,13 +409,15 @@ class AlertDispatcher:
 
             except ButtonUrlInvalidError:
                 # A link Telegram will not accept must never cost us the alert.
+                # Drop only the link button; the dismiss control stays.
                 logger.warning(
-                    "Telegram rejected the message link %r; sending without the button",
+                    "Message URL rejected by Telegram | msg_url=%r | sending without it",
                     alert.url,
                 )
-                if buttons is None:
+                retry = self._buttons(alert, with_url=False)
+                if buttons == retry:
                     return False
-                buttons = None
+                buttons = retry
 
             except FloodWaitError as exc:
                 wait_for = int(getattr(exc, "seconds", 0)) + 2

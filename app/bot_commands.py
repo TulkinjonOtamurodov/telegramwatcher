@@ -43,7 +43,9 @@ _ON_OFF = {"on": True, "off": False, "true": True, "false": False, "1": True, "0
 HELP_NOTE = (
     "Slash commands still work as well: /status /keywords /addkeyword "
     "/removekeyword /setmentions /setreplies /setkeywords /setmaxchars "
-    "/template /settemplate /reload"
+    "/template /settemplate /reload /keywordexclusions\n\n"
+    "To silence keyword alerts in a noisy group, send /excludekeywords inside "
+    "that group (and /allowkeywords to undo it)."
 )
 
 
@@ -67,6 +69,21 @@ COMMANDS: tuple[Command, ...] = (
     Command("template", "/template", "Show the current alert template"),
     Command("settemplate", "/settemplate <text>", "Replace the alert template"),
     Command("reload", "/reload", "Re-read keywords and settings from disk"),
+    Command(
+        "excludekeywords",
+        "/excludekeywords [chat id]",
+        "Silence keyword alerts for a group (run it inside the group)",
+    ),
+    Command(
+        "allowkeywords",
+        "/allowkeywords [chat id]",
+        "Re-enable keyword alerts for a group",
+    ),
+    Command(
+        "keywordexclusions",
+        "/keywordexclusions",
+        "List the keyword-excluded groups",
+    ),
 )
 
 
@@ -303,6 +320,80 @@ class BotCommands:
     async def _cmd_reload(self, event: Any, argument: str) -> None:
         await self.actions.reload()
         await self._reply(event, self.actions.reload_text())
+
+    # -- keyword exclusions ------------------------------------------------- #
+    async def _cmd_excludekeywords(self, event: Any, argument: str) -> None:
+        if not argument.strip():
+            await self._reply(
+                event,
+                "Send /excludekeywords **inside the group** you want to silence — "
+                "the chat id is taken from the message itself.\n\n"
+                "From here, pass the id instead: /excludekeywords -1001234567890\n"
+                "Use /keywordexclusions to see the current list.",
+            )
+            return
+        try:
+            title = await self.actions.exclude_chat(argument.strip())
+        except ActionError as exc:
+            await self._reply(event, f"⚠️ {exc}")
+            return
+        await self._reply(
+            event,
+            f"✅ Keyword alerts disabled for {title}.\n"
+            "Mentions and replies still alert there.",
+        )
+
+    async def _cmd_allowkeywords(self, event: Any, argument: str) -> None:
+        if not argument.strip():
+            await self._reply(
+                event,
+                "Send /allowkeywords **inside the group** you want to re-enable.\n\n"
+                "From here, pass the id instead: /allowkeywords -1001234567890",
+            )
+            return
+        try:
+            title = await self.actions.allow_chat(argument.strip())
+        except ActionError as exc:
+            await self._reply(event, f"⚠️ {exc}")
+            return
+        await self._reply(event, f"✅ Keyword alerts enabled for {title}.")
+
+    async def _cmd_keywordexclusions(self, event: Any, argument: str) -> None:
+        await self._reply(event, self.actions.exclusions_text())
+
+    async def handle_group_exclusion_command(
+        self, command: str, chat_id: int, title: str, sender_id: int | None
+    ) -> None:
+        """Apply an exclusion command typed inside a group.
+
+        Called by the watcher, which only forwards messages my own account sent.
+        The confirmation goes to the private bot chat rather than back into the
+        group, so nothing extra is posted where other people can see it.
+        """
+        if not (self.is_authorized(sender_id) or sender_id is None):
+            logger.warning(
+                "Ignoring in-group /%s from unauthorised id %s", command, sender_id
+            )
+            return
+
+        try:
+            if command == "excludekeywords":
+                label = await self.actions.exclude_chat(chat_id, title)
+                message = (
+                    f"✅ Keyword alerts disabled for {label}.\n"
+                    "Mentions and replies still alert there."
+                )
+            else:
+                label = await self.actions.allow_chat(chat_id)
+                message = f"✅ Keyword alerts enabled for {label}."
+        except ActionError as exc:
+            message = f"⚠️ {exc}"
+
+        dispatcher = self.actions.dispatcher
+        if dispatcher is not None:
+            await dispatcher.send_now(message)
+        else:  # pragma: no cover - dispatcher is always wired in main
+            logger.info("Exclusion result (no dispatcher to report it): %s", message)
 
     # Categories are exposed so a future AI command can list them.
     @staticmethod

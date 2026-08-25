@@ -225,28 +225,64 @@ def build_group_link(chat: Any, fallback: str = "-") -> str:
     return fallback
 
 
-def message_url(chat: Any, message_id: int | None) -> str | None:
-    """Deep link to one message, or ``None`` when Telegram has no link form.
+#: ``kind`` values returned by :func:`build_message_url` on success.
+LINK_PUBLIC = "public"
+LINK_PRIVATE_SUPERGROUP = "private_supergroup"
 
-    Public groups and channels use ``t.me/<username>/<id>``; private supergroups
-    use ``t.me/c/<internal id>/<id>``. Legacy basic groups have neither, and
-    neither does a message with no id -- both return ``None`` so the caller can
-    omit the button rather than render a dead link.
+#: ...and the reasons it can fail.
+NO_MESSAGE_ID = "no_message_id"
+NO_CHAT_METADATA = "no_chat_metadata"
+BASIC_GROUP = "basic_group"
+
+
+def build_message_url(
+    chat: Any, message_id: int | None, *, chat_id: int | None = None
+) -> tuple[str | None, str]:
+    """The single source of truth for message deep links.
+
+    Returns ``(url, kind)``. On success ``kind`` says which form was used; on
+    failure ``url`` is ``None`` and ``kind`` is the reason, which callers log.
+
+    * Public groups and channels -> ``t.me/<username>/<id>``
+    * Private supergroups and channels -> ``t.me/c/<internal id>/<id>``
+    * Legacy basic groups have no deep-link form at all.
+
+    ``chat_id`` is a fallback for when the chat entity could not be resolved:
+    ``event.chat_id`` is still a ``-100...`` peer id, and that is enough to
+    build the private form. Passing it turns some would-be missing buttons into
+    working ones.
     """
     if not message_id:
-        return None
+        return None, NO_MESSAGE_ID
+
     username = chat_username(chat)
     if username:
-        return f"https://t.me/{username}/{message_id}"
-    if is_channel(chat):
-        chat_id = normalize_channel_id(getattr(chat, "id", 0))
-        if chat_id:
-            return f"https://t.me/c/{chat_id}/{message_id}"
-    return None
+        return f"https://t.me/{username}/{message_id}", LINK_PUBLIC
+
+    if chat is not None and is_channel(chat):
+        internal = normalize_channel_id(getattr(chat, "id", 0))
+        if internal:
+            return f"https://t.me/c/{internal}/{message_id}", LINK_PRIVATE_SUPERGROUP
+
+    # No usable entity: a raw -100... peer id still identifies a supergroup or
+    # channel, which is exactly what the t.me/c/ form needs.
+    if chat_id is not None and str(chat_id).startswith("-100"):
+        internal = normalize_channel_id(chat_id)
+        if internal:
+            return f"https://t.me/c/{internal}/{message_id}", LINK_PRIVATE_SUPERGROUP
+
+    if chat is None:
+        return None, NO_CHAT_METADATA
+    return None, BASIC_GROUP
+
+
+def message_url(chat: Any, message_id: int | None, *, chat_id: int | None = None) -> str | None:
+    """Just the URL from :func:`build_message_url`, or ``None``."""
+    return build_message_url(chat, message_id, chat_id=chat_id)[0]
 
 
 def build_message_link(chat: Any, message_id: int, fallback: str = "-") -> str:
-    """String form of :func:`message_url`, for template placeholders."""
+    """String form, kept for the legacy ``{{message_link}}`` placeholder."""
     return message_url(chat, message_id) or fallback
 
 

@@ -77,6 +77,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "ai": {
         "enabled": False,
     },
+    # Chats where keyword matching is skipped, keyed by Telegram chat id as a
+    # string (JSON object keys must be strings). The value is the group title,
+    # kept only for display -- titles change, ids do not.
+    "keyword_excluded_chats": {},
 }
 
 MIN_MESSAGE_CHARS = 20

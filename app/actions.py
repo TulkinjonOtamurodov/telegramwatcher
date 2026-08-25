@@ -77,6 +77,22 @@ def on_off(value: bool) -> str:
     return "ON" if value else "OFF"
 
 
+# Module-level readers so the watcher can check exclusions without depending on
+# the whole command/panel object graph.
+def excluded_chats_from(settings: SettingsStore) -> dict[str, str]:
+    raw = settings.get("keyword_excluded_chats", {})
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): str(value) for key, value in raw.items()}
+
+
+def is_chat_excluded(settings: SettingsStore, chat_id: Any) -> bool:
+    """True when keyword matching should be skipped for this chat."""
+    if chat_id is None:
+        return False
+    return str(chat_id) in excluded_chats_from(settings)
+
+
 class MakimaActions:
     """Every state change and every rendered view, in one place."""
 
@@ -183,6 +199,69 @@ class MakimaActions:
         await self.settings.set("alerts.template", DEFAULT_TEMPLATE)
         logger.info("Alert template reset to the default")
 
+    # -- keyword exclusions ------------------------------------------------- #
+    #
+    # Excluding a chat suppresses *keyword* matching there and nothing else.
+    # Mentions and replies still raise alerts, so a noisy group stays watched
+    # for the things that actually need you.
+
+    def excluded_chats(self) -> dict[str, str]:
+        """``{"-1001234567890": "Claims Discussion"}`` -- ids are the key."""
+        return excluded_chats_from(self.settings)
+
+    def is_chat_excluded(self, chat_id: Any) -> bool:
+        return is_chat_excluded(self.settings, chat_id)
+
+    def excluded_count(self) -> int:
+        return len(self.excluded_chats())
+
+    async def exclude_chat(self, chat_id: Any, title: str = "") -> str:
+        """Stop keyword matching in one chat. Returns the stored title."""
+        key = self._normalize_chat_id(chat_id)
+        current = self.excluded_chats()
+        if key in current:
+            raise ActionError("Keyword alerts are already disabled for that group.")
+        label = str(title).strip() or f"Chat {key}"
+        current[key] = label
+        await self.settings.set("keyword_excluded_chats", current)
+        logger.info("Keyword exclusion added | chat=%s | group=%s", key, label)
+        return label
+
+    async def allow_chat(self, chat_id: Any) -> str:
+        """Resume keyword matching in one chat. Returns the removed title."""
+        key = self._normalize_chat_id(chat_id)
+        current = self.excluded_chats()
+        if key not in current:
+            raise ActionError("Keyword alerts are not disabled for that group.")
+        label = current.pop(key)
+        await self.settings.set("keyword_excluded_chats", current)
+        logger.info("Keyword exclusion removed | chat=%s | group=%s", key, label)
+        return label
+
+    @staticmethod
+    def _normalize_chat_id(chat_id: Any) -> str:
+        text = str(chat_id).strip()
+        if not text.lstrip("-").isdigit():
+            raise ActionError(
+                f"'{text}' is not a Telegram chat id. Ids look like -1001234567890."
+            )
+        return text
+
+    def exclusions_text(self) -> str:
+        excluded = self.excluded_chats()
+        if not excluded:
+            return (
+                "🚫 KEYWORD EXCLUSIONS (0)\n\n"
+                "No groups are excluded. Keyword alerts are active everywhere.\n\n"
+                "Send /excludekeywords inside a noisy group to silence keyword "
+                "alerts there. Mentions and replies keep working."
+            )
+        lines = [f"🚫 KEYWORD EXCLUSIONS ({len(excluded)})", ""]
+        for chat_id, title in excluded.items():
+            lines.append(f"- {title}\n  {chat_id}")
+        lines += ["", "Mentions and replies still alert in these groups."]
+        return "\n".join(lines)
+
     async def reload(self) -> None:
         """Re-read every data file from disk without restarting the process."""
         await self.settings.load()
@@ -202,6 +281,7 @@ class MakimaActions:
             f"Keywords: {on_off(settings.watch_keywords)}",
             f"Keywords loaded: {self.keywords.count()}",
             f"Watched members: {self.watched.count() if self.watched else 0}",
+            f"Keyword-excluded groups: {self.excluded_count()}",
             f"Max preview chars: {settings.max_message_chars}",
             f"AI classification: {on_off(settings.ai_enabled)}"
             + (
