@@ -28,7 +28,7 @@ from telethon.errors import (
 )
 
 from app.actions import ActionError, MakimaActions, on_off
-from app.alert_lifecycle import CB_ALERT_SEEN
+from app.alert_lifecycle import CB_VIEW_PREFIX
 from app.logging_config import get_logger
 from app.settings import MAX_MESSAGE_CHARS, MIN_MESSAGE_CHARS
 from app.utils import TELEGRAM_MAX_MESSAGE, truncate
@@ -544,10 +544,12 @@ class ControlPanel:
 
     # -- callback handling -------------------------------------------------- #
     async def _on_callback(self, event: Any) -> None:
-        # Alert buttons belong to app.alert_lifecycle, which is registered first
-        # and stops propagation. This guard is belt-and-braces: if the ordering
-        # ever changes, the panel still must not redraw somebody's alert.
-        if bytes(getattr(event, "data", b"") or b"") == CB_ALERT_SEEN:
+        # Alert buttons belong to app.alert_lifecycle (VIEW) and app.fuel.service
+        # (FA/FC), both registered first and stopping propagation. This guard is
+        # belt-and-braces: if the ordering ever changes, the panel still must not
+        # redraw somebody's alert.
+        data_prefix = bytes(getattr(event, "data", b"") or b"")
+        if data_prefix.startswith(CB_VIEW_PREFIX.encode()) or data_prefix[:2] in (b"FA", b"FC"):
             return
 
         sender_id = getattr(event, "sender_id", None)

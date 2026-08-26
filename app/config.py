@@ -135,6 +135,10 @@ class Config:
         return self.data_dir / "fuel_state.json"
 
     @property
+    def alert_views_file(self) -> Path:
+        return self.data_dir / "alert_views.json"
+
+    @property
     def defaults_dir(self) -> Path:
         return self.data_dir / "defaults"
 

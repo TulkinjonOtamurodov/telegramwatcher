@@ -25,6 +25,7 @@ data/watched_users.json
 data/group_rules.json
 data/fuel_units.json
 data/fuel_state.json
+data/alert_views.json
 data/*.corrupt
 data/.*.tmp
 

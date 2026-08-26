@@ -1,25 +1,35 @@
-"""Alert lifecycle: marking an alert seen, then deleting it on a timer.
+"""VIEW MESSAGE clicks, and deleting an alert five minutes after one.
 
-**Telegram does not tell a bot when a URL button is pressed.** A
-``KeyboardButtonUrl`` is handled entirely by the client: it opens the link and
-sends nothing back to the server. There is no update, no callback query, no
-counter -- the bot genuinely cannot know. (The one exception, ``urlAuth`` /
-Login URL buttons, is an OAuth handshake for external websites registered with
-BotFather; it does not apply to ``t.me`` deep links.)
+**Telegram does not report clicks on URL buttons.** A ``KeyboardButtonUrl`` is
+resolved entirely inside the client: it opens the link and sends the bot
+nothing -- no update, no callback query, no counter. So a single button cannot
+both open ``t.me/c/123/456`` and tell us it was pressed.
 
-So the alert carries two buttons: the real URL button that opens the message,
-and a callback button next to it that the admin taps to dismiss. Tapping it
-schedules deletion of *that recipient's copy* five minutes later.
+``answerCallbackQuery`` does take a ``url``, but Telegram restricts it to game
+URLs and ``t.me/<bot>?start=`` deep links back to the bot itself. It will not
+open an arbitrary chat message, so it cannot close the gap either. (The other
+candidate, ``KeyboardButtonUrlAuth`` / Login URL, is an OAuth handshake for a
+domain registered with BotFather -- also not applicable to a ``t.me`` link.)
 
-Timers are in-memory ``asyncio`` tasks. **A container restart cancels every
-pending deletion** -- the alert simply stays in the chat. That is a deliberate
-trade for a five-minute timer: persisting it would mean a file write per alert
-and a rehydration pass at startup, for a failure window most restarts never hit.
+So VIEW MESSAGE is a **callback** button. Pressing it is what MAKIMA observes:
+it starts the five-minute timer, then swaps the keyboard for a real URL button
+so the very next tap opens the message. Two taps, one visible button at a time,
+and no second "seen" button to press -- the interaction that begins viewing is
+the interaction that starts the countdown.
+
+Deletion is scheduled *only* by that click. An alert nobody touches stays
+forever. Pending deletions are persisted, so a restart mid-countdown resumes
+rather than forgetting.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import secrets
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from telethon import Button, events
@@ -32,194 +42,353 @@ from telethon.errors import (
 )
 
 from app.logging_config import get_logger
+from app.utils import atomic_write_text
 
 logger = get_logger("lifecycle")
 
-#: Callback data for the dismiss button. Short, and distinct from every
-#: control-panel code so the two handlers never collide.
-CB_ALERT_SEEN = b"ALSEEN"
+#: Callback prefix. Data stays tiny -- the URL lives server-side, never in the
+#: payload, which keeps us well inside Telegram's 64-byte limit.
+CB_VIEW_PREFIX = "v:"
 
-#: How long after the tap the alert is removed.
+#: How long after the click the alert is removed.
 DELETE_AFTER_SECONDS = 300  # 5 minutes
 
-OPEN_MESSAGE_LABEL = "\U0001f517 OPEN MESSAGE"
-SEEN_LABEL = "✅ SEEN — DELETE IN 5 MIN"
-PENDING_LABEL = "🕒 Deleting in 5 min…"
+#: How often pending deletions are checked.
+SWEEP_SECONDS = 30
+
+#: Unviewed records are pruned after this long, so the file cannot grow forever.
+RECORD_TTL_HOURS = 72
+
+VIEW_LABEL = "🔗 VIEW MESSAGE"
+OPEN_LABEL = "🔗 OPEN IN TELEGRAM"
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso(moment: datetime | None) -> str | None:
+    return moment.astimezone(timezone.utc).isoformat() if moment else None
+
+
+def _parse(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+@dataclass
+class AlertView:
+    """One delivered alert copy and its deletion state."""
+
+    token: str
+    recipient: int
+    chat_id: int
+    alert_message_id: int | None = None
+    source_url: str = ""
+    source_chat_id: str = ""
+    source_message_id: int | None = None
+    created_at: str = field(default_factory=lambda: _iso(_now()) or "")
+    viewed_at: str | None = None
+    delete_at: str | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 class AlertLifecycle:
-    """Owns the dismiss callback and the pending-deletion timers."""
+    """Owns the VIEW callback and the pending-deletion sweep."""
 
     def __init__(
         self,
         bot_client: Any,
         *,
         is_authorized: Callable[[int | None], bool],
+        path: Path,
         delay: int = DELETE_AFTER_SECONDS,
+        sweep_seconds: int = SWEEP_SECONDS,
     ) -> None:
         self._bot = bot_client
         self._is_authorized = is_authorized
+        self._path = path
         self._delay = delay
-        # Keyed by (chat_id, message_id): one timer per delivered copy, so one
-        # recipient dismissing never touches another recipient's alert.
-        self._pending: dict[tuple[int, int], asyncio.Task[None]] = {}
+        self._sweep_seconds = sweep_seconds
+        self._lock = asyncio.Lock()
+        self._records: dict[str, AlertView] = {}
+        self._task: asyncio.Task[None] | None = None
         self._registered = False
 
-    # -- lifecycle --------------------------------------------------------- #
-    def register(self) -> None:
+    # -- persistence -------------------------------------------------------- #
+    def _read(self) -> dict[str, AlertView]:
+        if not self._path.is_file():
+            return {}
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.error("Could not read %s (%s); starting empty", self._path, exc)
+            return {}
+
+        records: dict[str, AlertView] = {}
+        for token, payload in (raw.get("pending") or {}).items():
+            if not isinstance(payload, dict):
+                continue
+            fields = {
+                key: value
+                for key, value in payload.items()
+                if key in AlertView.__dataclass_fields__
+            }
+            fields["token"] = str(token)
+            try:
+                records[str(token)] = AlertView(**fields)
+            except TypeError:
+                logger.warning("Skipping malformed alert-view record %s", token)
+        return records
+
+    async def _write(self) -> None:
+        payload = json.dumps(
+            {"pending": {token: rec.to_json() for token, rec in self._records.items()}},
+            indent=2,
+            ensure_ascii=False,
+        )
+        await asyncio.to_thread(atomic_write_text, self._path, payload + "\n")
+
+    # -- lifecycle ---------------------------------------------------------- #
+    async def start(self) -> None:
+        async with self._lock:
+            self._records = await asyncio.to_thread(self._read)
+        logger.info(
+            "Alert lifecycle loaded | pending=%d | delete_after=%ds",
+            len(self._records),
+            self._delay,
+        )
+        self._register()
+        # Anything already due -- clicked before a restart that outlasted the
+        # countdown -- is removed on this first sweep, not forgotten.
+        await self._sweep()
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run(), name="alert-lifecycle")
+
+    def _register(self) -> None:
         if self._registered:
             return
         self._bot.add_event_handler(
-            self._on_seen, events.CallbackQuery(pattern=CB_ALERT_SEEN)
+            self._on_view, events.CallbackQuery(pattern=CB_VIEW_PREFIX.encode())
         )
         self._registered = True
-        logger.info(
-            "Alert lifecycle registered (dismiss then delete after %ds)", self._delay
-        )
+        logger.info("VIEW MESSAGE handler registered")
 
     async def stop(self) -> None:
-        """Cancel every pending deletion; alerts are left in place."""
-        tasks = list(self._pending.values())
-        self._pending.clear()
-        for task in tasks:
-            task.cancel()
-        for task in tasks:
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):  # noqa: B014 - shutdown path
-                pass
-        if tasks:
-            logger.info("Cancelled %d pending alert deletion(s) on shutdown", len(tasks))
+        if self._task is None:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        self._task = None
 
     @property
     def pending_count(self) -> int:
-        return len(self._pending)
+        return sum(1 for rec in self._records.values() if rec.delete_at)
 
-    # -- callback ---------------------------------------------------------- #
-    async def _on_seen(self, event: Any) -> None:
-        """Handle a tap on the dismiss button."""
+    # -- registration from the dispatcher ------------------------------------ #
+    async def new_view(
+        self,
+        *,
+        recipient: int,
+        source_url: str,
+        source_chat_id: Any = "",
+        source_message_id: int | None = None,
+    ) -> str:
+        """Reserve a token before the alert is sent, and return it.
+
+        The token has to exist before sending, because it goes inside the
+        button. The alert's own message id is attached afterwards.
+        """
+        token = secrets.token_hex(4)
+        record = AlertView(
+            token=token,
+            recipient=int(recipient),
+            chat_id=int(recipient),
+            source_url=source_url,
+            source_chat_id=str(source_chat_id or ""),
+            source_message_id=source_message_id,
+        )
+        async with self._lock:
+            self._records[token] = record
+            self._prune()
+            await self._write()
+        return token
+
+    async def attach_message(self, token: str, alert_message_id: int) -> None:
+        """Record which delivered message a token belongs to."""
+        async with self._lock:
+            record = self._records.get(token)
+            if record is None:
+                return
+            record.alert_message_id = int(alert_message_id)
+            await self._write()
+
+    @staticmethod
+    def view_button(token: str) -> Any:
+        return Button.inline(VIEW_LABEL, f"{CB_VIEW_PREFIX}{token}".encode())
+
+    def _prune(self) -> None:
+        """Drop stale unviewed records. Viewed ones are kept until deleted."""
+        cutoff = _now() - timedelta(hours=RECORD_TTL_HOURS)
+        for token in [
+            token
+            for token, rec in self._records.items()
+            if not rec.delete_at and (_parse(rec.created_at) or _now()) < cutoff
+        ]:
+            self._records.pop(token, None)
+
+    # -- the click ------------------------------------------------------------ #
+    async def _on_view(self, event: Any) -> None:
         try:
             sender_id = getattr(event, "sender_id", None)
             if not self._is_authorized(sender_id):
-                logger.warning("Unauthorised alert dismissal from user id %s", sender_id)
+                logger.warning("Unauthorised VIEW callback from user id %s", sender_id)
                 await self._answer(event, "⛔ Not authorised.", alert=True)
                 raise events.StopPropagation
 
-            chat_id = getattr(event, "chat_id", None)
-            message_id = getattr(event, "message_id", None)
-            if message_id is None:
-                message_id = getattr(getattr(event, "query", None), "msg_id", None)
+            data = bytes(getattr(event, "data", b"") or b"").decode("utf-8", "ignore")
+            token = data[len(CB_VIEW_PREFIX):].strip()
+            record = self._records.get(token)
 
-            if chat_id is None or message_id is None:
-                await self._answer(event, "⚠️ Could not identify this alert.", alert=True)
+            if record is None:
+                await self._answer(event, "This alert is no longer tracked.", alert=True)
                 raise events.StopPropagation
 
-            minutes = max(1, self._delay // 60)
-            await self._answer(event, f"Will disappear in {minutes} min")
-            await self._mark_pending(event)
-            self.schedule_delete(int(chat_id), int(message_id), recipient=sender_id)
+            # A token belongs to one recipient's copy. Another admin pressing a
+            # forged payload must not touch it.
+            if record.recipient != sender_id:
+                logger.warning(
+                    "VIEW token %s belongs to %s, pressed by %s",
+                    token,
+                    record.recipient,
+                    sender_id,
+                )
+                await self._answer(event, "⛔ Not your alert.", alert=True)
+                raise events.StopPropagation
 
-            logger.info(
-                "Alert marked seen | recipient=%s | alert_msg=%s", sender_id, message_id
+            already = record.delete_at is not None
+            if not already:
+                async with self._lock:
+                    record.viewed_at = _iso(_now())
+                    record.delete_at = _iso(_now() + timedelta(seconds=self._delay))
+                    await self._write()
+                logger.info(
+                    "VIEW MESSAGE clicked | recipient=%s | alert_msg=%s | source_msg=%s",
+                    record.recipient,
+                    record.alert_message_id,
+                    record.source_message_id,
+                )
+                logger.info(
+                    "Alert deletion scheduled | alert_msg=%s | delay=%d",
+                    record.alert_message_id,
+                    self._delay,
+                )
+
+            minutes = max(1, self._delay // 60)
+            await self._answer(
+                event,
+                f"Opening… this alert disappears in {minutes} min"
+                if not already
+                else "Already counting down",
             )
+            # Swap in a real URL button: the next tap opens the message.
+            await self._show_open_button(event, record)
 
         except events.StopPropagation:
             raise
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Failed to handle an alert dismissal")
+            logger.exception("Failed to handle a VIEW MESSAGE click")
 
-        # This callback is ours; the control panel must not also react to it.
         raise events.StopPropagation
 
-    async def _mark_pending(self, event: Any) -> None:
-        """Grey the dismiss button out, keeping the link button usable."""
+    async def _show_open_button(self, event: Any, record: AlertView) -> None:
+        if not record.source_url:
+            return
         try:
             message = await event.get_message()
-        except Exception:
-            logger.debug("Could not load the alert message to update it", exc_info=True)
-            return
-        if message is None:
-            return
-
-        url = self._existing_url(message)
-        buttons: list[list[Any]] = []
-        if url:
-            buttons.append([Button.url(OPEN_MESSAGE_LABEL, url)])
-        buttons.append([Button.inline(PENDING_LABEL, CB_ALERT_SEEN)])
-
-        try:
-            # The text is passed back explicitly: Telethon parses whatever it is
-            # given, and handing it None would raise rather than keep the body.
+            text = getattr(message, "raw_text", "") or ""
             await event.edit(
-                message.raw_text or "",
-                buttons=buttons,
+                text,
+                buttons=[[Button.url(OPEN_LABEL, record.source_url)]],
                 link_preview=False,
                 parse_mode=None,
             )
         except RPCError:
-            logger.debug("Could not update the alert buttons", exc_info=True)
+            logger.debug("Could not swap in the open-in-Telegram button", exc_info=True)
         except Exception:
-            logger.debug("Unexpected error updating the alert buttons", exc_info=True)
+            logger.debug("Unexpected error swapping the VIEW button", exc_info=True)
 
-    @staticmethod
-    def _existing_url(message: Any) -> str | None:
-        """Recover the OPEN MESSAGE url already attached to the alert."""
-        markup = getattr(message, "reply_markup", None)
-        for row in getattr(markup, "rows", None) or []:
-            for button in getattr(row, "buttons", None) or []:
-                url = getattr(button, "url", None)
-                if url:
-                    return str(url)
-        return None
+    # -- the sweep ------------------------------------------------------------ #
+    async def _run(self) -> None:
+        while True:
+            await asyncio.sleep(self._sweep_seconds)
+            try:
+                await self._sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Alert lifecycle sweep failed")
 
-    # -- deletion ---------------------------------------------------------- #
-    def schedule_delete(
-        self, chat_id: int, message_id: int, *, recipient: int | None = None
-    ) -> None:
-        """Queue one alert copy for deletion, without blocking anything."""
-        key = (int(chat_id), int(message_id))
-        if key in self._pending:
-            logger.debug("Deletion already scheduled for %s", key)
+    async def _sweep(self) -> None:
+        """Delete every alert whose countdown has finished."""
+        instant = _now()
+        due = [
+            record
+            for record in list(self._records.values())
+            if record.delete_at
+            and record.alert_message_id
+            and (_parse(record.delete_at) or instant) <= instant
+        ]
+        if not due:
             return
-        task = asyncio.create_task(
-            self._delete_later(key, recipient), name=f"alert-delete-{message_id}"
-        )
-        self._pending[key] = task
-        task.add_done_callback(lambda _t, k=key: self._pending.pop(k, None))
 
-    async def _delete_later(
-        self, key: tuple[int, int], recipient: int | None
-    ) -> None:
-        chat_id, message_id = key
+        for record in due:
+            await self._delete(record)
+
+        async with self._lock:
+            for record in due:
+                self._records.pop(record.token, None)
+            await self._write()
+
+    async def _delete(self, record: AlertView) -> None:
+        """Remove one alert copy. The source message is never touched."""
         try:
-            await asyncio.sleep(self._delay)
-            await self._bot.delete_messages(chat_id, [message_id])
+            await self._bot.delete_messages(record.chat_id, [record.alert_message_id])
             logger.info(
-                "Alert deleted | recipient=%s | alert_msg=%s", recipient or chat_id, message_id
+                "Alert deleted after view | recipient=%s | alert_msg=%s",
+                record.recipient,
+                record.alert_message_id,
             )
-        except asyncio.CancelledError:
-            raise
-        except (MessageIdInvalidError, MessageDeleteForbiddenError) as exc:
-            # Already gone, or too old to delete. Neither is worth an error.
-            logger.info(
-                "Alert %s not deleted (%s); nothing to do", message_id, type(exc).__name__
-            )
+        except (MessageIdInvalidError, MessageDeleteForbiddenError):
+            logger.info("Alert already gone | alert_msg=%s", record.alert_message_id)
         except FloodWaitError as exc:
-            logger.warning("Flood wait (%ss) while deleting alert %s", exc.seconds, message_id)
+            logger.warning(
+                "Flood wait (%ss) deleting alert %s", exc.seconds, record.alert_message_id
+            )
         except RPCError:
-            logger.info("Telegram refused to delete alert %s", message_id, exc_info=True)
+            logger.info(
+                "Telegram refused to delete alert %s", record.alert_message_id, exc_info=True
+            )
         except Exception:
-            logger.exception("Unexpected failure deleting alert %s", message_id)
+            logger.exception("Unexpected failure deleting alert %s", record.alert_message_id)
 
-    # -- plumbing ---------------------------------------------------------- #
+    # -- plumbing -------------------------------------------------------------- #
     async def _answer(self, event: Any, message: str = "", *, alert: bool = False) -> None:
         try:
             await event.answer(message or None, alert=alert)
         except (QueryIdInvalidError, MessageIdInvalidError):
             logger.debug("Callback query expired before it could be answered")
-        except FloodWaitError as exc:
-            logger.warning("Flood wait (%ss) while answering a dismissal", exc.seconds)
         except RPCError:
             logger.debug("Telegram rejected a callback answer", exc_info=True)

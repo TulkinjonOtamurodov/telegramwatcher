@@ -68,8 +68,8 @@ Private MAKIMA Alerts
 - **Per-group keyword rules** — ignore noisy global keywords in one group, add
   group-only keywords, or switch keyword matching off there entirely. Mentions
   and replies always keep working.
-- **Self-clearing alerts** — tap SEEN and the alert removes itself after five
-  minutes.
+- **Self-clearing alerts** — tap VIEW MESSAGE and the alert removes itself five
+  minutes later. Untouched alerts stay.
 - **Private bot control panel** — add and remove keywords, flip modes, change
   the alert template, all from a Telegram chat. No SSH, no file editing.
 - **Live config updates** — every change is written to disk immediately and
@@ -439,8 +439,7 @@ invented for a message that does not have one.
 **The buttons.** The message link is an inline button, never text:
 
 ```
-[ 🔗 OPEN MESSAGE ]
-[ ✅ SEEN — DELETE IN 5 MIN ]
+[ 🔗 VIEW MESSAGE ]
 ```
 
 | Chat type | Link |
@@ -462,13 +461,11 @@ land in the log:
 Message URL built | group=Dispatch | msg=68044 | url_type=private_supergroup_topic | url=https://t.me/c/1234567890/12/68044
 ```
 
-**Tapping SEEN** deletes that alert from your bot chat five minutes later. The
-original group message is never touched. Each recipient's copy is tracked
-separately — one admin dismissing theirs leaves everyone else's alone.
+**Tapping VIEW MESSAGE** starts a five-minute countdown and swaps in a real URL
+button so the next tap opens the message. When it expires MAKIMA deletes its own
+copy; the source message is never touched. An alert you never press stays.
 
-Telegram never tells a bot that a URL button was pressed, so the dismiss button
-has to be a separate callback button. See
-[Alert lifecycle](#alert-lifecycle) for the detail.
+See [Alert lifecycle](#alert-lifecycle) for why it takes two taps.
 
 ### Placeholders
 
@@ -841,41 +838,61 @@ resolve between them. Use a host-reachable address, and add this to MAKIMA's
 
 ## Alert lifecycle
 
-**Telegram does not tell a bot when a URL button is pressed.** A URL button is
-handled entirely inside the client: it opens the link and sends nothing to the
-server. There is no update, no callback, no counter. The bot genuinely cannot
-know. (The one exception, `urlAuth` / Login URL buttons, is an OAuth handshake
-for external websites registered with BotFather, and does not apply to `t.me`
-deep links.)
-
-So "delete the alert after I open it" cannot be implemented literally. Instead
-each alert carries two buttons:
+Every alert carries one button:
 
 ```
-[ 🔗 OPEN MESSAGE ]           <- real URL button, opens the message
-[ ✅ SEEN — DELETE IN 5 MIN ]  <- callback button, the one we can detect
+[ 🔗 VIEW MESSAGE ]
 ```
 
-Tapping **SEEN**:
+Pressing it starts a **five-minute countdown**, then swaps the button for a real
+URL button so the next tap opens the message. When the countdown finishes,
+MAKIMA deletes *its own copy* of the alert from your bot chat. The message in
+the source group is never touched.
 
-1. acknowledges the callback so the spinner clears;
-2. greys the button to `🕒 Deleting in 5 min…`, leaving the link usable;
-3. schedules deletion of *that copy* five minutes later.
+An alert you never press stays forever. Deletion is scheduled **only** by the
+click — never by age, never by delivery time.
 
-Deletion runs as its own asyncio task, so it never blocks the watcher and one
-alert's timer is independent of any other. Deleting an alert that is already
-gone is logged at INFO and ignored. **Only MAKIMA's copy in your bot chat is
-deleted — the original group message is never touched.**
+### Why it takes two taps
 
-Multiple recipients are handled separately: every delivered copy has its own
-chat id and message id, and the callback identifies exactly the one that was
-tapped. If one admin dismisses their alert, everyone else's stays.
+**Telegram does not report clicks on URL buttons.** A `KeyboardButtonUrl` is
+resolved entirely inside the client: it opens the link and sends the bot
+nothing. No update, no callback query, no counter. A single URL button
+therefore cannot start a timer, because MAKIMA would never learn it was pressed.
 
-**Known limitation:** the timers are in memory. A container restart within the
-five-minute window cancels the pending deletions and those alerts simply stay in
-the chat. That is a deliberate trade — persisting a five-minute timer would mean
-a disk write per alert and a rehydration pass at startup, for a window most
-restarts never hit.
+`answerCallbackQuery` does accept a `url`, but Telegram restricts that to game
+URLs and `t.me/<bot>?start=` deep links back to the bot — it will not open an
+arbitrary chat message. `KeyboardButtonUrlAuth` (Login URL) is an OAuth
+handshake against a domain registered with BotFather, also not applicable.
+
+So VIEW MESSAGE is a **callback** button, which is the one thing Telegram does
+report. There is no second "seen" button to press: the interaction that begins
+viewing is the interaction that starts the countdown.
+
+The only genuine one-tap alternative would be a URL button pointing at a web
+endpoint MAKIMA controls, which logs the click and 302-redirects to Telegram.
+That needs a public HTTPS endpoint and a domain, and bounces you through a
+browser. Not worth it for this.
+
+### Per-copy, per-recipient
+
+Each delivered copy gets its own token, bound to that recipient and that
+message id. Clicking one alert never affects another, and one admin's click
+never deletes another admin's copy — a token whose recipient does not match the
+presser is rejected.
+
+Callback data is `v:<8 hex chars>`; the URL is stored server-side, never in the
+payload.
+
+### Restart safety
+
+Pending deletions live in `data/alert_views.json` on the Docker volume:
+recipient, alert message id, source url, `viewed_at`, `delete_at`. A sweep every
+30 seconds deletes whatever is due.
+
+If MAKIMA restarts mid-countdown, the first sweep after startup catches up:
+anything whose `delete_at` has passed is deleted immediately, anything still
+pending keeps counting. Unviewed records are pruned after 72 hours so the file
+cannot grow without bound.
 
 ---
 

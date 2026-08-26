@@ -10,6 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
+from telethon import utils as tl_utils
+from telethon.tl import types as tl_types
+
 #: Telegram rejects messages longer than 4096 characters.
 TELEGRAM_MAX_MESSAGE = 4096
 
@@ -255,6 +258,93 @@ def forum_topic_id(message: Any) -> int | None:
         return int(topic) if topic else None
     except (TypeError, ValueError):
         return None
+
+
+#: More reasons a link cannot be built.
+LEGACY_PRIVATE_GROUP = "legacy_private_group"
+PRIVATE_CHAT = "private_chat"
+UNKNOWN_PEER = "unknown_peer"
+
+
+def describe_media(message: Any) -> str:
+    """Short label for whatever media a message carries, or '' for plain text."""
+    for attribute in ("photo", "video", "voice", "audio", "sticker", "document"):
+        if getattr(message, attribute, None):
+            return attribute
+    return "media" if getattr(message, "media", None) else ""
+
+
+def build_telegram_message_url(
+    chat: Any, message: Any, *, chat_id: Any = None
+) -> tuple[str | None, str]:
+    """The one place a message deep link is built. Returns ``(url, kind)``.
+
+    Resolves the peer through Telethon's own ``get_peer_id`` / ``resolve_id``
+    rather than sniffing attributes off the chat entity. That matters because
+    the chat entity is not always a fully-populated ``Channel``: it can be a
+    partial object, a ``ChannelForbidden``, or missing entirely when
+    ``get_chat()`` fails. The message's own ``peer_id`` is always present and
+    always authoritative -- and it is present identically for text and media, so
+    a photo links exactly like a sentence does.
+
+    Media is never linked to its file or CDN URL: the link is to the *message*.
+    """
+    message_id = getattr(message, "id", None)
+    if not message_id:
+        return None, NO_MESSAGE_ID
+
+    # 1. Prefer the peer carried on the message itself.
+    marked: int | None = None
+    peer = getattr(message, "peer_id", None)
+    if peer is not None:
+        try:
+            marked = int(tl_utils.get_peer_id(peer))
+        except (TypeError, ValueError, AttributeError):
+            marked = None
+
+    # 2. Fall back to the event's chat id, then to the entity's own id.
+    if marked is None and chat_id is not None:
+        try:
+            marked = int(chat_id)
+        except (TypeError, ValueError):
+            marked = None
+    if marked is None and chat is not None:
+        try:
+            marked = int(tl_utils.get_peer_id(chat))
+        except (TypeError, ValueError, AttributeError):
+            marked = None
+
+    if marked is None:
+        return None, NO_CHAT_METADATA
+
+    try:
+        internal_id, peer_cls = tl_utils.resolve_id(marked)
+    except (TypeError, ValueError):
+        return None, UNKNOWN_PEER
+
+    # Only channels and supergroups have a message deep-link form at all.
+    if peer_cls is not tl_types.PeerChannel:
+        if peer_cls is tl_types.PeerChat:
+            return None, LEGACY_PRIVATE_GROUP
+        if peer_cls is tl_types.PeerUser:
+            return None, PRIVATE_CHAT
+        return None, UNKNOWN_PEER
+
+    topic_id = forum_topic_id(message)
+    in_topic = bool(topic_id) and topic_id != message_id
+    suffix = f"{topic_id}/{message_id}" if in_topic else f"{message_id}"
+
+    username = chat_username(chat)
+    if username:
+        return (
+            f"https://t.me/{username}/{suffix}",
+            LINK_PUBLIC_TOPIC if in_topic else LINK_PUBLIC,
+        )
+
+    return (
+        f"https://t.me/c/{internal_id}/{suffix}",
+        LINK_PRIVATE_TOPIC if in_topic else LINK_PRIVATE_SUPERGROUP,
+    )
 
 
 def build_message_url(

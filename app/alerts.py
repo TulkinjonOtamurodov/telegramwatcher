@@ -28,16 +28,16 @@ from telethon.errors import (
     UserIsBlockedError,
 )
 
-from app.alert_lifecycle import CB_ALERT_SEEN, OPEN_MESSAGE_LABEL, SEEN_LABEL
+from app.alert_lifecycle import AlertLifecycle
 from app.logging_config import get_logger
 from app.settings import SettingsStore
 from app.utils import (
     TELEGRAM_MAX_MESSAGE,
     build_group_link,
     build_message_link,
-    build_message_url,
+    build_telegram_message_url,
+    describe_media,
     display_name,
-    forum_topic_id,
     render_template,
     split_heading,
     truncate,
@@ -90,6 +90,8 @@ class Alert:
     text: str
     url: str | None = None
     dismissible: bool = True
+    source_chat_id: str = ""
+    source_message_id: int | None = None
 
 
 def keyword_reason(keyword: str) -> str:
@@ -148,25 +150,6 @@ def format_triggers(reasons: Sequence[str], keyword_hits: Sequence[str], limit: 
     return TRIGGER_SEPARATOR.join(parts) if parts else "ALERT"
 
 
-def _describe_media(message: Any) -> str:
-    """A short label for a message that carries media."""
-    if getattr(message, "photo", None):
-        return "photo"
-    if getattr(message, "video", None):
-        return "video"
-    if getattr(message, "voice", None):
-        return "voice message"
-    if getattr(message, "audio", None):
-        return "audio"
-    if getattr(message, "sticker", None):
-        return "sticker"
-    if getattr(message, "document", None):
-        return "document"
-    if getattr(message, "media", None):
-        return "media"
-    return ""
-
-
 def build_alert(
     event: Any,
     *,
@@ -187,26 +170,27 @@ def build_alert(
     group_name = display_name(chat, fallback="Unknown group")
 
     # One central helper decides the link; here we only report what it decided.
-    url, kind = build_message_url(
-        chat,
-        message_id,
-        chat_id=getattr(event, "chat_id", None),
-        topic_id=forum_topic_id(message),
+    url, kind = build_telegram_message_url(
+        chat, message, chat_id=getattr(event, "chat_id", None)
     )
+    media = describe_media(message)
     if url:
         logger.info(
-            "Message URL built | group=%s | msg=%s | url_type=%s | url=%s",
-            group_name,
+            "Message URL built%s | chat=%s | msg=%s | type=%s%s | url=%s",
+            " for media" if media else "",
+            getattr(event, "chat_id", None),
             message_id,
             kind,
+            f" | media={media}" if media else "",
             url,
         )
     else:
         logger.warning(
-            "Message URL unavailable | group=%s | msg=%s | reason=%s",
-            group_name,
+            "Message URL unavailable | chat=%s | msg=%s | reason=%s%s",
+            getattr(event, "chat_id", None),
             message_id,
             kind,
+            f" | media={media}" if media else "",
         )
 
     sender_display = sender_name or "Unknown"
@@ -224,7 +208,7 @@ def build_alert(
         heading, body = split_heading(raw_text)
         body = truncate(body, settings.max_message_chars)
     else:
-        media = _describe_media(message)
+        media = describe_media(message)
         body = f"(no text - {media})" if media else "(no text)"
 
     heading_line = f"{HEADING_PREFIX}{heading}" if heading else ""
@@ -270,7 +254,12 @@ def build_alert(
     }
 
     rendered = render_template(settings.template, variables)
-    return Alert(text=truncate(rendered, TELEGRAM_MAX_MESSAGE, suffix="\n[...]"), url=url)
+    return Alert(
+        text=truncate(rendered, TELEGRAM_MAX_MESSAGE, suffix="\n[...]"),
+        url=url,
+        source_chat_id=str(getattr(event, "chat_id", "") or ""),
+        source_message_id=message_id or None,
+    )
 
 
 class AlertDispatcher:
@@ -278,6 +267,7 @@ class AlertDispatcher:
 
     def __init__(self, bot_client: Any, recipients: Sequence[int] | None = None) -> None:
         self._bot = bot_client
+        self._lifecycle: AlertLifecycle | None = None
         self._recipients: list[int] = list(recipients or [])
         self._queue: asyncio.Queue[Alert] = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
         self._worker: asyncio.Task[None] | None = None
@@ -285,6 +275,10 @@ class AlertDispatcher:
         self._failed = 0
 
     # -- lifecycle --------------------------------------------------------- #
+    def set_lifecycle(self, lifecycle: AlertLifecycle | None) -> None:
+        """Attach the VIEW-click tracker that owns alert deletion."""
+        self._lifecycle = lifecycle
+
     def set_recipients(self, recipients: Iterable[int]) -> None:
         self._recipients = list(dict.fromkeys(recipients))
         logger.info("Alert recipients: %s", self._recipients or "(none configured)")
@@ -384,45 +378,52 @@ class AlertDispatcher:
         return delivered_any
 
     @staticmethod
-    def _buttons(alert: Alert, *, with_url: bool = True) -> list[list[Any]] | None:
-        """The deep-link button when there is a link, plus the dismiss button.
+    async def _view_button(self, recipient: int, alert: Alert) -> tuple[Any, str | None]:
+        """The single VIEW MESSAGE button, plus the token it is bound to.
 
-        Telegram never reports a URL-button press, so the second (callback)
-        button is what tells us the admin is done with the alert.
+        It is a *callback* button, not a URL button: Telegram never reports a
+        URL-button press, so a URL button here could not start the deletion
+        countdown. Pressing this one is what MAKIMA observes; the lifecycle then
+        swaps in a real URL button so the next tap opens the message.
         """
-        if not alert.dismissible:
-            return None
-        rows: list[list[Any]] = []
-        if alert.url and with_url:
-            rows.append([Button.url(OPEN_MESSAGE_LABEL, alert.url)])
-        rows.append([Button.inline(SEEN_LABEL, CB_ALERT_SEEN)])
-        return rows
+        if not alert.dismissible or not alert.url or self._lifecycle is None:
+            return None, None
+
+        token = await self._lifecycle.new_view(
+            recipient=recipient,
+            source_url=alert.url,
+            source_chat_id=alert.source_chat_id,
+            source_message_id=alert.source_message_id,
+        )
+        return [[self._lifecycle.view_button(token)]], token
 
     async def _send_to(self, recipient: int, alert: Alert) -> bool:
-        buttons = self._buttons(alert)
+        buttons, token = await self._view_button(recipient, alert)
 
         for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
             try:
-                await self._bot.send_message(
+                sent = await self._bot.send_message(
                     recipient,
                     alert.text,
                     buttons=buttons,
                     link_preview=False,
                     parse_mode=None,  # group content is sent verbatim, never parsed
                 )
+                # Bind this recipient's copy to its token, so a click later
+                # deletes exactly this message and nobody else's.
+                if token and self._lifecycle is not None and sent is not None:
+                    await self._lifecycle.attach_message(token, sent.id)
                 return True
 
             except ButtonUrlInvalidError:
                 # A link Telegram will not accept must never cost us the alert.
-                # Drop only the link button; the dismiss control stays.
                 logger.warning(
                     "Message URL rejected by Telegram | msg_url=%r | sending without it",
                     alert.url,
                 )
-                retry = self._buttons(alert, with_url=False)
-                if buttons == retry:
+                if buttons is None:
                     return False
-                buttons = retry
+                buttons, token = None, None
 
             except FloodWaitError as exc:
                 wait_for = int(getattr(exc, "seconds", 0)) + 2

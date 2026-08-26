@@ -220,8 +220,13 @@ async def run() -> int:
         )
         # Registered before the control panel so its StopPropagation keeps the
         # panel from redrawing an alert when the dismiss button is tapped.
-        lifecycle = AlertLifecycle(bot_client, is_authorized=commands.is_authorized)
-        lifecycle.register()
+        lifecycle = AlertLifecycle(
+            bot_client,
+            is_authorized=commands.is_authorized,
+            path=config.alert_views_file,
+        )
+        await lifecycle.start()
+        dispatcher.set_lifecycle(lifecycle)
 
         commands.register()
         watcher.set_exclusion_handler(commands.handle_group_exclusion_command)
