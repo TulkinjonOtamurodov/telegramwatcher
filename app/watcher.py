@@ -35,7 +35,9 @@ logger = get_logger("watcher")
 #: user client because that is the only client actually in those groups -- the
 #: bot never joins one, and that separation is deliberate.
 GROUP_COMMAND_RE = re.compile(
-    r"^/(excludekeywords|allowkeywords|grouprules)(?:@[\w_]+)?\s*$", re.IGNORECASE
+    r"^/(excludekeywords|allowkeywords|grouprules|mapfuelunit|unmapfuelunit|fuelunit)"
+    r"(?:@[\w_]+)?(?:\s+(\S+))?\s*$",
+    re.IGNORECASE,
 )
 
 
@@ -51,6 +53,7 @@ class Watcher:
         dispatcher: AlertDispatcher,
         watched: Any = None,
         group_rules: Any = None,
+        fuel: Any = None,
     ) -> None:
         self._client = user_client
         self._settings = settings
@@ -58,6 +61,7 @@ class Watcher:
         self._dispatcher = dispatcher
         self._watched = watched
         self._group_rules = group_rules
+        self._fuel = fuel
 
         self._me_id: int | None = None
         self._me_username: str | None = None
@@ -210,6 +214,7 @@ class Watcher:
                 return
 
             command = (event.pattern_match.group(1) or "").lower()
+            argument = (event.pattern_match.group(2) or "").strip()
             chat_id = getattr(event, "chat_id", None)
             if chat_id is None:
                 logger.warning("Exclusion command with no resolvable chat id; ignored")
@@ -224,7 +229,9 @@ class Watcher:
             logger.info(
                 "Group command /%s | chat=%s | group=%s", command, chat_id, title
             )
-            await self._exclusion_handler(command, int(chat_id), title, event.sender_id)
+            await self._exclusion_handler(
+                command, int(chat_id), title, event.sender_id, argument
+            )
 
         except asyncio.CancelledError:
             raise
@@ -255,6 +262,17 @@ class Watcher:
         self.messages_seen += 1
         text = event.raw_text or ""
         settings = self._settings
+
+        # Fuel automation runs first and independently of the keyword engine, so
+        # a load confirmation is still processed in a group whose keywords are
+        # excluded. It never suppresses the normal alert path below.
+        if self._fuel is not None:
+            try:
+                await self._fuel.handle_message(event, getattr(event, "chat", None), text)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Fuel automation failed to handle a message")
 
         reasons: list[str] = []
 

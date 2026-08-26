@@ -41,6 +41,22 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.lower() in {"1", "true", "yes", "on", "y"}
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = _env(name)
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        raise ConfigError(f"{name} must be a number, got {raw!r}.") from None
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = _env(name)
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        raise ConfigError(f"{name} must be a whole number, got {raw!r}.") from None
+
+
 def _env_path(name: str, default: Path) -> Path:
     raw = _env(name)
     return Path(raw).expanduser() if raw else default
@@ -84,6 +100,12 @@ class Config:
     ai_api_key: str | None = None
     ai_model: str | None = None
 
+    fuel_automation_enabled: bool = False
+    fuelhelper_api_url: str | None = None
+    fuelhelper_api_token: str | None = None
+    fuel_deadline_hours_before_pickup: float = 3.0
+    fuel_reminder_interval_minutes: int = 60
+
     connection_retries: int = -1  # -1 == retry forever
     retry_delay: int = 5
     request_retries: int = 5
@@ -105,6 +127,14 @@ class Config:
         return self.data_dir / "group_rules.json"
 
     @property
+    def fuel_units_file(self) -> Path:
+        return self.data_dir / "fuel_units.json"
+
+    @property
+    def fuel_state_file(self) -> Path:
+        return self.data_dir / "fuel_state.json"
+
+    @property
     def defaults_dir(self) -> Path:
         return self.data_dir / "defaults"
 
@@ -124,6 +154,8 @@ class Config:
     def secrets(self) -> tuple[str, ...]:
         """Values that must be redacted before anything reaches a log file."""
         values = [self.api_hash, self.bot_token]
+        if self.fuelhelper_api_token:
+            values.append(self.fuelhelper_api_token)
         if self.phone:
             values.append(self.phone)
         if self.ai_api_key:
@@ -201,4 +233,11 @@ def load_config(*, require_bot_token: bool = True) -> Config:
         ai_provider=_env("AI_PROVIDER"),
         ai_api_key=_env("AI_API_KEY"),
         ai_model=_env("AI_MODEL"),
+        fuel_automation_enabled=_env_bool("FUEL_AUTOMATION_ENABLED", False),
+        fuelhelper_api_url=_env("FUELHELPER_API_URL"),
+        fuelhelper_api_token=_env("FUELHELPER_API_TOKEN"),
+        fuel_deadline_hours_before_pickup=_env_float(
+            "FUEL_DEADLINE_HOURS_BEFORE_PICKUP", 3.0
+        ),
+        fuel_reminder_interval_minutes=_env_int("FUEL_REMINDER_INTERVAL_MINUTES", 60),
     )

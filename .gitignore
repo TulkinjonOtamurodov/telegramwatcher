@@ -23,6 +23,8 @@ data/keywords.txt
 data/watcher_settings.json
 data/watched_users.json
 data/group_rules.json
+data/fuel_units.json
+data/fuel_state.json
 data/*.corrupt
 data/.*.tmp
 

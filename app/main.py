@@ -28,6 +28,10 @@ from app.clients import (
     start_bot_client,
 )
 from app.config import Config, ConfigError, load_config
+from app.fuel.client import FuelHelperClient
+from app.fuel.service import FuelService
+from app.fuel.state import FuelStateStore
+from app.fuel.units import UnitMappingStore
 from app.group_rules import GroupRulesStore
 from app.keywords import KeywordStore
 from app.logging_config import get_logger, register_secret, setup_logging
@@ -142,6 +146,7 @@ async def run() -> int:
 
     dispatcher: AlertDispatcher | None = None
     lifecycle: AlertLifecycle | None = None
+    fuel: FuelService | None = None
     monitor: ConnectionMonitor | None = None
     watcher: Any = None
     stop_event = asyncio.Event()
@@ -160,6 +165,24 @@ async def run() -> int:
         dispatcher.set_recipients(admins)
         await dispatcher.start()
 
+        fuel = FuelService(
+            bot_client,
+            state=FuelStateStore(config.fuel_state_file),
+            units=UnitMappingStore(
+                config.fuel_units_file,
+                defaults_path=config.defaults_dir / "fuel_units.json",
+            ),
+            client=FuelHelperClient(
+                config.fuelhelper_api_url, config.fuelhelper_api_token
+            ),
+            recipients=lambda: admins,
+            is_authorized=lambda user_id: user_id in set(admins),
+            deadline_hours_before=config.fuel_deadline_hours_before_pickup,
+            reminder_interval_minutes=config.fuel_reminder_interval_minutes,
+            enabled=config.fuel_automation_enabled,
+        )
+        await fuel.start()
+
         # Imported here so that a syntax error in the watcher cannot stop the
         # config/logging diagnostics above from running.
         from app.watcher import Watcher
@@ -171,6 +194,7 @@ async def run() -> int:
             dispatcher=dispatcher,
             watched=watched,
             group_rules=group_rules,
+            fuel=fuel,
         )
         watcher.bind_identity(me)
         await watcher.start()
@@ -188,6 +212,7 @@ async def run() -> int:
             dispatcher=dispatcher,
             watched=watched,
             group_rules=group_rules,
+            fuel=fuel,
             identity={
                 "user_display": user_display,
                 "bot_username": getattr(bot_me, "username", None),
@@ -256,6 +281,8 @@ async def run() -> int:
             await watcher.stop()
         if lifecycle is not None:
             await lifecycle.stop()
+        if fuel is not None:
+            await fuel.stop()
         if dispatcher is not None:
             await dispatcher.stop()
         await disconnect_quietly(user_client, "user")

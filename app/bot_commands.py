@@ -28,6 +28,7 @@ from app.actions import (
 )
 from app.ai_classifier import CATEGORIES
 from app.control_panel import ControlPanel
+from app.fuel.units import UnitMappingError, describe_mappings
 from app.keywords import KeywordStore
 from app.logging_config import get_logger
 from app.settings import MAX_MESSAGE_CHARS, MIN_MESSAGE_CHARS, SettingsStore
@@ -89,6 +90,8 @@ COMMANDS: tuple[Command, ...] = (
         "/grouprules [chat id]",
         "Per-group keyword rules (run it inside a group to configure that one)",
     ),
+    Command("fuelstatus", "/fuelstatus", "Active fuel deadlines and statuses"),
+    Command("fuelunits", "/fuelunits", "List the group-to-truck mappings"),
 )
 
 
@@ -106,9 +109,11 @@ class BotCommands:
         dispatcher: Any = None,
         watched: Any = None,
         group_rules: Any = None,
+        fuel: Any = None,
         identity: dict[str, Any] | None = None,
     ) -> None:
         self._bot = bot_client
+        self.fuel = fuel
         self._settings = settings
         self._keywords = keywords
         self._admin_ids = admin_ids
@@ -387,7 +392,12 @@ class BotCommands:
         await self.panel.send_group_panel(event, target)
 
     async def handle_group_exclusion_command(
-        self, command: str, chat_id: int, title: str, sender_id: int | None
+        self,
+        command: str,
+        chat_id: int,
+        title: str,
+        sender_id: int | None,
+        argument: str = "",
     ) -> None:
         """Apply an exclusion command typed inside a group.
 
@@ -399,6 +409,11 @@ class BotCommands:
             logger.warning(
                 "Ignoring in-group /%s from unauthorised id %s", command, sender_id
             )
+            return
+
+        # Fuel unit mapping, run inside the group it applies to.
+        if command in ("mapfuelunit", "unmapfuelunit", "fuelunit"):
+            await self._handle_fuel_group_command(command, chat_id, title, argument)
             return
 
         # /grouprules opens the configuration panel for this group, privately.
@@ -430,6 +445,71 @@ class BotCommands:
             await dispatcher.send_now(message)
         else:  # pragma: no cover - dispatcher is always wired in main
             logger.info("Exclusion result (no dispatcher to report it): %s", message)
+
+    # -- fuel automation ------------------------------------------------------ #
+    async def _handle_fuel_group_command(
+        self, command: str, chat_id: int, title: str, argument: str
+    ) -> None:
+        """``/mapfuelunit``, ``/unmapfuelunit`` and ``/fuelunit``, run in a group.
+
+        The chat id comes straight off the message, which is why this is the
+        reliable place to map a group. The reply goes to the private bot chat so
+        nothing configuration-related is posted where the group can see it.
+        """
+        if self.fuel is None:
+            await self._notify("⚠️ Fuel automation is not enabled.")
+            return
+
+        units = self.fuel.units
+        try:
+            if command == "mapfuelunit":
+                if not argument:
+                    await self._notify(
+                        "Usage: /mapfuelunit <unit>\nFor example: /mapfuelunit 152"
+                    )
+                    return
+                mapping = await units.set_mapping(chat_id, argument, group_title=title)
+                await self._notify(
+                    f"✅ This group is now mapped to Unit {mapping.unit}.\n\n"
+                    f"🏢 {mapping.display_title}\nChat ID: {mapping.chat_id}"
+                )
+            elif command == "unmapfuelunit":
+                unit = await units.remove(chat_id)
+                await self._notify(f"✅ Unit {unit} is no longer mapped to this group.")
+            else:  # fuelunit
+                mapping = units.get(chat_id)
+                if mapping is None:
+                    await self._notify(
+                        "This group is not mapped to a unit.\n\n"
+                        "Map it with: /mapfuelunit <unit>"
+                    )
+                else:
+                    await self._notify(
+                        f"🚛 UNIT {mapping.unit}\n\n"
+                        f"🏢 {mapping.display_title}\nChat ID: {mapping.chat_id}"
+                    )
+        except UnitMappingError as exc:
+            await self._notify(f"⚠️ {exc}")
+
+    async def _notify(self, text: str) -> None:
+        """Send a short note to every admin, via the existing dispatcher."""
+        dispatcher = self.actions.dispatcher
+        if dispatcher is not None:
+            await dispatcher.send_now(text)
+        else:  # pragma: no cover - dispatcher is always wired in main
+            logger.info("Fuel note (no dispatcher): %s", text)
+
+    async def _cmd_fuelstatus(self, event: Any, argument: str) -> None:
+        if self.fuel is None:
+            await self._reply(event, "Fuel automation is not enabled.")
+            return
+        await self._reply(event, self.fuel.desk_text())
+
+    async def _cmd_fuelunits(self, event: Any, argument: str) -> None:
+        if self.fuel is None:
+            await self._reply(event, "Fuel automation is not enabled.")
+            return
+        await self._reply(event, describe_mappings(self.fuel.units.all()))
 
     # Categories are exposed so a future AI command can list them.
     @staticmethod

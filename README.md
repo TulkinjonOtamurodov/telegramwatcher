@@ -42,6 +42,7 @@ Private MAKIMA Alerts
 - [Alert format](#alert-format)
 - [Watched members](#watched-members)
 - [Group rules](#group-rules)
+- [Fuel automation](#fuel-automation)
 - [Alert lifecycle](#alert-lifecycle)
 - [Hostinger VPS deployment](#hostinger-vps-deployment)
 - [Updating](#updating)
@@ -164,6 +165,9 @@ excludekeywords - Silence keyword alerts for a group
 allowkeywords - Re-enable keyword alerts for a group
 keywordexclusions - List configured group rules
 grouprules - Per-group keyword rules
+mapfuelunit - Map this group to a truck
+fuelstatus - Active fuel deadlines
+fuelunits - Group-to-truck mappings
 ```
 
 To revoke a leaked token: BotFather → `/mybots` → your bot → **API Token** →
@@ -704,6 +708,137 @@ group rules as `keywords_enabled: false` on first start. No manual migration.
 
 ---
 
+## Fuel automation
+
+Off by default. Set `FUEL_AUTOMATION_ENABLED=true` to turn it on; with it false
+MAKIMA behaves exactly as it did before.
+
+When a load confirmation lands in a group mapped to a truck, MAKIMA reads the
+pickup time, subtracts three hours, and chases you until you say the fuel is
+arranged:
+
+```
+load confirmation → deadline − 3h → UPCOMING
+                                      ↓ deadline arrives
+                                  NEED TO ARRANGE → alert, then hourly reminders
+                                      ↓ you press ARRANGED
+                                   ARRANGED → reminders stop
+```
+
+A new confirmation for the same truck always starts a fresh cycle, including
+from ARRANGED — the previous load being handled says nothing about this one.
+
+### Mapping a group to a truck
+
+Load confirmations rarely name the unit, so the **group** identifies the truck.
+Send this inside the group, from the account MAKIMA watches with:
+
+```
+/mapfuelunit 152
+```
+
+The chat id is taken from the message itself, and the reply comes back in your
+private bot chat. Also available in-group: `/unmapfuelunit` and `/fuelunit`.
+From the bot chat: `/fuelunits` lists the mappings, `/fuelstatus` shows active
+deadlines.
+
+### The deadline rule
+
+Deadline = **earliest pickup time − 3 hours**, in the pickup location's own
+timezone.
+
+| Pickup time | Used | Deadline |
+| --- | --- | --- |
+| `11:30 AM APPT` | 11:30 | 08:30 local |
+| `08:00AM-17:00 PM` | 08:00 (earliest) | 05:00 local |
+
+The earliest end of a window is the safer operational choice — the truck can be
+called at the start of it.
+
+### Statuses
+
+Only four: `UPCOMING`, `NEED TO ARRANGE`, `ARRANGED`, `NEED TO CHECK`.
+
+`NEED TO CHECK` is what MAKIMA uses whenever it cannot be certain — an
+unparsable pickup, a timezone it cannot resolve, an unmapped group. It never
+invents a time.
+
+### Alerts
+
+At the deadline, and hourly after it:
+
+```
+#FUEL
+
+🔴 UNIT 152 NEEDS FUEL.
+
+Fernando Vallejos Rivas
+Deadline passed 1h ago.
+
+[ ✅ ARRANGED ] [ ⚠️ NEED TO CHECK ]
+[ 🔗 OPEN MESSAGE ]
+```
+
+**ARRANGED** sets the state, writes `Arranged` to FuelHelper, stops reminders
+and rewrites the alert to show it is handled. **NEED TO CHECK** parks the unit
+so it stops reminding until the next load.
+
+Typing `fuel arranged` (or `arranged`, `fuel done`) in a mapped group also
+works, but only for a short standalone message in a group mapped to exactly one
+truck. The button is the primary route.
+
+### Persistence and restart
+
+`data/fuel_state.json` holds one active cycle per unit — deadline, status, chat
+id, source message id, last reminder. `data/fuel_units.json` holds the mappings.
+Both sit on the Docker volume.
+
+The scheduler is a single loop that ticks every 60 seconds and asks the state
+file what is owed *now*. Nothing is scheduled in advance, so a restart rebuilds
+nothing: a unit that went overdue while the container was down is simply overdue
+on the next tick, and duplicate reminders are impossible because there are no
+timer objects to leak.
+
+Each confirmation is recorded as `chat_id:message_id`, so a reposted or
+re-delivered message never opens a second cycle.
+
+### FuelHelper
+
+MAKIMA writes the board through the endpoint FuelHelper already has:
+
+```
+PATCH /api/units/{unit}   {"fuel_status": "Need to arrange"}
+```
+
+with `Authorization: Bearer $FUELHELPER_API_TOKEN`. It writes at the deadline,
+on ARRANGED and on NEED TO CHECK — **not** while a deadline is still in the
+future, since `Upcoming` is a value the board has never had and adding it would
+be the disruptive option.
+
+Every call fails safely. MAKIMA's own state file is authoritative for
+scheduling, so a FuelHelper outage delays the mirror, never the alert.
+
+### Configuration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FUEL_AUTOMATION_ENABLED` | `false` | Master switch |
+| `FUELHELPER_API_URL` | — | e.g. `http://host.docker.internal:4173` |
+| `FUELHELPER_API_TOKEN` | — | Must equal `FUEL_API_KEY` in FuelHelper's `.env` |
+| `FUEL_DEADLINE_HOURS_BEFORE_PICKUP` | `3` | Hours before pickup |
+| `FUEL_REMINDER_INTERVAL_MINUTES` | `60` | Reminder cadence |
+
+Both stacks run as separate compose projects, so Docker service DNS does not
+resolve between them. Use a host-reachable address, and add this to MAKIMA's
+`docker-compose.yml` if you use `host.docker.internal`:
+
+```yaml
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+```
+
+---
+
 ## Alert lifecycle
 
 **Telegram does not tell a bot when a URL button is pressed.** A URL button is
@@ -1101,6 +1236,14 @@ telegram-watcher/
 │   ├── alert_lifecycle.py    # dismiss button and deletion timers
 │   ├── keywords.py           # keyword storage and matching
 │   ├── group_rules.py        # per-group keyword rules and instructions
+│   ├── fuel/                 # fuel deadline automation (off by default)
+│   │   ├── parser.py         # load detection + pickup parsing
+│   │   ├── timezones.py      # US pickup location -> timezone
+│   │   ├── units.py          # group -> truck mapping
+│   │   ├── state.py          # one active fuel cycle per truck
+│   │   ├── scheduler.py      # 60s tick: deadlines and reminders
+│   │   ├── client.py         # FuelHelper HTTP client
+│   │   └── service.py        # orchestration, alerts, buttons
 │   ├── watched_users.py      # watched members and mention matching
 │   ├── settings.py           # settings with deep-merge and atomic writes
 │   ├── utils.py              # links, templates, atomic file writes

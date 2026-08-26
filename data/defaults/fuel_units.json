@@ -1,0 +1,4 @@
+{
+  "_readme": "Telegram group -> truck mapping for fuel automation. Keyed by chat id, which is stable across group renames. 'driver' is an optional fallback: FuelHelper is preferred as the source of driver names. Send /mapfuelunit <unit> inside a group to add it, or /reload after editing by hand.",
+  "mappings": {}
+}
