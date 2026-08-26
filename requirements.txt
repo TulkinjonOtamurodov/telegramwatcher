@@ -6,3 +6,7 @@ python-dotenv==1.0.1
 # large media. Not required; uncomment if you want it and the wheel installs
 # cleanly on your platform.
 # cryptg==0.4.0
+
+# zoneinfo needs an IANA tz database; python:3.12-slim does not ship one, and
+# without it every pickup timezone fails as timezone_database_missing.
+tzdata==2024.1
