@@ -377,7 +377,6 @@ class AlertDispatcher:
             self._failed += 1
         return delivered_any
 
-    @staticmethod
     async def _view_button(self, recipient: int, alert: Alert) -> tuple[Any, str | None]:
         """The single VIEW MESSAGE button, plus the token it is bound to.
 
